@@ -1,0 +1,213 @@
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:uuid/uuid.dart';
+import 'package:flutter/foundation.dart';
+import 'hive_service.dart';
+import 'firestore_service.dart';
+import 'notification_service.dart';
+import 'auth_service.dart';
+
+const _uuid = Uuid();
+
+/// Manages offline sync queue and auto-escalation
+class SyncService {
+  final FirestoreService _firestore = FirestoreService();
+
+  // ══════════ QUEUE AN OFFLINE ACTION ══════════
+
+  /// Add any action to the sync queue (called when offline or as safety net)
+  /// Set [skipImmediateSync] to true during batch operations (e.g. import)
+  static Future<void> queueAction({
+    required String action, // 'CREATE', 'UPDATE', 'DELETE'
+    required String collection,
+    required String documentId,
+    required Map<String, dynamic> data,
+    bool skipImmediateSync = false,
+  }) async {
+    final item = {
+      'id': _uuid.v4(),
+      'action': action,
+      'collection': collection,
+      'documentId': documentId,
+      'data': data,
+      'timestamp': DateTime.now().toIso8601String(),
+      'retryCount': 0,
+    };
+
+    await HiveService.addToSyncQueue(item);
+
+    // Try immediate sync if online, but do NOT abort if slow or offline
+    // Fire-and-forget to prevent UI elements from freezing indefinitely
+    if (!skipImmediateSync) {
+      final connectivity = await Connectivity().checkConnectivity();
+      if (connectivity != ConnectivityResult.none) {
+        SyncService()._processSingleItem(item).then((_) {
+          HiveService.removeFromSyncQueue(item['id'] as String);
+        }).catchError((e) {
+          debugPrint('Immediate sync failed, queued for later: $e');
+        });
+      }
+    }
+  }
+
+  // ══════════ PROCESS SYNC QUEUE ══════════
+
+  /// Process all pending sync actions (called by WorkManager or manually)
+  Future<void> processQueue() async {
+    final queue = HiveService.getSyncQueue();
+    if (queue.isEmpty) return;
+
+    // Sort by timestamp (oldest first)
+    queue.sort((a, b) => (a['timestamp'] ?? '').toString().compareTo(
+        (b['timestamp'] ?? '').toString()));
+
+    for (final item in queue) {
+      try {
+        await _processSingleItem(item);
+        await HiveService.removeFromSyncQueue(item['id'] as String);
+      } catch (e) {
+        debugPrint('Sync error for ${item['id'] as String}: $e');
+        final retryCount = (item['retryCount'] ?? 0) + 1;
+        if (retryCount >= 5) {
+          // Give up after 5 retries
+          await HiveService.removeFromSyncQueue(item['id'] as String);
+          debugPrint('Sync item ${item['id'] as String} dropped after 5 retries');
+        } else {
+          item['retryCount'] = retryCount;
+          await HiveService.addToSyncQueue(item);
+        }
+      }
+    }
+  }
+
+  /// Process a single sync item
+  Future<void> _processSingleItem(Map<String, dynamic> item) async {
+    final collection = item['collection'] as String;
+    final documentId = item['documentId'] as String;
+    final data = Map<String, dynamic>.from(item['data'] ?? {});
+    final action = item['action'] as String;
+
+    switch (action) {
+      case 'CREATE':
+      case 'UPDATE':
+        await _firestore.setDocument(collection, documentId, data);
+        break;
+      case 'DELETE':
+        await _firestore.deleteDocument(collection, documentId);
+        break;
+    }
+  }
+
+  // ══════════ FULL SYNC (Cloud → Hive) ══════════
+
+  /// Download all data from Firestore into Hive (called on login/app start)
+  Future<void> fullSync() async {
+    try {
+      final uid = AuthService().currentUser?.uid ?? '';
+      if (uid.isEmpty) return;
+
+      final db = FirebaseFirestore.instance;
+
+      // Prevent stale cross-account data from lingering in local cache.
+      await HiveService.clearBox(HiveService.casesBox);
+      await HiveService.clearBox(HiveService.tasksBox);
+      await HiveService.clearBox(HiveService.assignmentsBox);
+      await HiveService.clearBox(HiveService.chatGroupsBox);
+      await HiveService.clearBox(HiveService.remindersBox);
+
+      // Run all collection queries concurrently to drastically reduce login time
+      final futures = await Future.wait([
+        db.collection('cases').where('participantIds', arrayContains: uid).get(),
+        db.collection('tasks').where('participantIds', arrayContains: uid).get(),
+        db.collection('tasks').where('assignedJuniorIds', arrayContains: uid).get(),
+        db.collection('tasks').where('isPublic', isEqualTo: true).get(),
+        db.collection('assignments').where('participantIds', arrayContains: uid).get(),
+        db.collection('assignments').where('assignedToIds', arrayContains: uid).get(),
+        db.collection('assignments').where('assignedToId', isEqualTo: uid).get(),
+        db.collection('notices').get(),
+        db.collection('reminders').where('createdBy', isEqualTo: uid).get(),
+        db.collection('chatGroups').where('memberIds', arrayContains: uid).get(),
+      ]);
+
+      for (final doc in futures[0].docs) {
+        final data = doc.data();
+        final cino = (data['cino'] as String? ?? '').trim();
+        final key = cino.isNotEmpty ? cino : doc.id;
+        await HiveService.put(HiveService.casesBox, key, data);
+      }
+      for (final doc in [...futures[1].docs, ...futures[2].docs, ...futures[3].docs]) {
+        await HiveService.put(HiveService.tasksBox, doc.id, doc.data());
+      }
+      for (final doc in [...futures[4].docs, ...futures[5].docs, ...futures[6].docs]) {
+        await HiveService.put(HiveService.assignmentsBox, doc.id, doc.data());
+      }
+      for (final doc in futures[7].docs) await HiveService.put(HiveService.noticesBox, doc.id, doc.data());
+      for (final doc in futures[8].docs) await HiveService.put(HiveService.remindersBox, doc.id, doc.data());
+      for (final doc in futures[9].docs) await HiveService.put(HiveService.chatGroupsBox, doc.id, doc.data());
+
+      // Also process any pending uploads
+      await processQueue();
+
+      // Record sync time
+      await HiveService.saveSetting(
+          'lastFullSync', DateTime.now().toIso8601String());
+
+      debugPrint('Full sync completed: ${futures[0].docs.length} cases');
+    } catch (e) {
+      debugPrint('Full sync error (working from cached data): $e');
+    }
+  }
+
+  // ══════════ AUTO-ESCALATION ══════════
+
+  /// Check all tasks and auto-escalate overdue ones
+  /// Only escalates Tasks (not Assignments — per spec)
+  Future<void> checkEscalations() async {
+    final tasks = HiveService.getAll(HiveService.tasksBox);
+    final now = DateTime.now();
+    bool escalatedAny = false;
+
+    for (final task in tasks) {
+      // Only escalate 'task' type, not 'assignment'
+      if (task['type'] != 'task') continue;
+      if (task['status'] == 'completed') continue;
+      if (task['isEscalated'] == true) continue;
+      if (task['autoEscalate'] != true) continue;
+
+      final deadline = DateTime.tryParse(task['deadline'] ?? '');
+      if (deadline != null && now.isAfter(deadline)) {
+        // ESCALATE
+        task['isEscalated'] = true;
+        task['isPublic'] = true;
+        task['escalatedAt'] = now.toIso8601String();
+        task['status'] = 'overdue';
+        task['updatedAt'] = now.toIso8601String();
+        escalatedAny = true;
+
+        // Update local
+        await HiveService.put(HiveService.tasksBox, task['id'], task);
+
+        // Queue for cloud sync
+        await queueAction(
+          action: 'UPDATE',
+          collection: 'tasks',
+          documentId: task['id'],
+          data: task,
+        );
+
+        // Local notification
+        await NotificationService.show(
+          title: '⚠️ Task Escalated',
+          body: '"${task['title']}" deadline missed — now visible to entire team.',
+        );
+
+        debugPrint('Escalated task: ${task['title']}');
+      }
+    }
+
+    if (escalatedAny) {
+      // Force queue processing once so all users see escalated visibility quickly.
+      await processQueue();
+    }
+  }
+}

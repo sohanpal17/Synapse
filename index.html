@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synapse - Smart Litigation Management System</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Inter', sans-serif; }
+        .gradient-bg {
+            background: linear-gradient(135deg, #0F2A44 0%, #1a3a5c 50%, #3C6E9F 100%);
+        }
+        .code-block {
+            background: #1e1e2e;
+            border-radius: 12px;
+            font-family: 'Fira Code', monospace;
+            font-size: 14px;
+            overflow-x: auto;
+            position: relative;
+        }
+        .code-block::before {
+            content: '';
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            width: 12px;
+            height: 12px;
+            background: #ff5f56;
+            border-radius: 50%;
+            box-shadow: 20px 0 0 #ffbd2e, 40px 0 0 #27ca40;
+        }
+        .accent { color: #E0B973; }
+        .copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(255,255,255,0.1);
+            border: none;
+            color: #888;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .copy-btn:hover {
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+        }
+        .feature-card {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 24px;
+            transition: all 0.3s;
+        }
+        .feature-card:hover {
+            background: rgba(255,255,255,0.08);
+            transform: translateY(-4px);
+        }
+    </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+    <div class="container mx-auto px-6 py-12 max-w-5xl">
+        <!-- Header -->
+        <div class="text-center mb-16">
+            <div class="inline-flex items-center justify-center w-24 h-24 rounded-full bg-white/10 mb-6">
+                <svg class="w-12 h-12 text-[#E0B973]" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 2L2 7v10l10 5 10-5V7L12 2zm0 2.18l6.9 3.45L12 11.09 5.1 7.64 12 4.18zM4 8.82l7 3.5v7.36l-7-3.5V8.82zm9 10.86v-7.36l7-3.5v7.36l-7 3.5z"/>
+                </svg>
+            </div>
+            <h1 class="text-5xl font-bold mb-4">
+                <span class="accent">Synapse</span>
+            </h1>
+            <p class="text-white/60 text-xl mb-2">The Smart Litigation Management System</p>
+            <p class="text-white/40 text-sm max-w-2xl mx-auto">Collaborative legal workspace with TimeTree-style scheduling, offline-first architecture, and automated compliance tools.</p>
+        </div>
+
+        <!-- Key Features Grid -->
+        <div class="mb-16">
+            <h2 class="text-2xl font-semibold mb-8 text-center"><span class="accent">✨</span> Key Features</h2>
+            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <!-- Feature 1 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-blue-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">📅</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Shared Firm Calendar</h3>
+                    <p class="text-white/50 text-sm">TimeTree-style unified calendar with color-coded events (Hearings, Meetings, Deadlines) and contextual chat within each event.</p>
+                </div>
+                <!-- Feature 2 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-purple-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">📋</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Dual-Tier Work Allocation</h3>
+                    <p class="text-white/50 text-sm">Separate Tasks (quick admin items) from Assignments (substantive legal work with progress tracking & review stages).</p>
+                </div>
+                <!-- Feature 3 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-yellow-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">🔒</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Conditional Privacy</h3>
+                    <p class="text-white/50 text-sm">Work stays private until deadlines are missed, then auto-escalates to public visibility for accountability.</p>
+                </div>
+                <!-- Feature 4 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-green-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">🚦</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Traffic Light Urgency</h3>
+                    <p class="text-white/50 text-sm">Visual indicators: 🟢 Green (>7 days), 🟡 Yellow (3-7 days), 🔴 Red (<48 hours) - works offline!</p>
+                </div>
+                <!-- Feature 5 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">🆘</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Courtroom SOS</h3>
+                    <p class="text-white/50 text-sm">Panic button for interns - instantly alerts senior counsel with court room & item number details.</p>
+                </div>
+                <!-- Feature 6 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-cyan-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">📴</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Offline-First Mode</h3>
+                    <p class="text-white/50 text-sm">Full functionality in court dead zones - auto-syncs when connectivity is restored.</p>
+                </div>
+                <!-- Feature 7 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-orange-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">⏱️</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Limitation Calculator</h3>
+                    <p class="text-white/50 text-sm">Auto-calculate filing deadlines with 15-day, 7-day, and 1-day reminder scheduling.</p>
+                </div>
+                <!-- Feature 8 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-pink-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">📄</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">One-Tap Documents</h3>
+                    <p class="text-white/50 text-sm">Generate Exemption (205/317), Bail, and Adjournment applications pre-filled with case details.</p>
+                </div>
+                <!-- Feature 9 -->
+                <div class="feature-card">
+                    <div class="w-12 h-12 rounded-xl bg-indigo-500/20 flex items-center justify-center mb-4">
+                        <span class="text-2xl">💬</span>
+                    </div>
+                    <h3 class="font-semibold text-lg mb-2">Contextual Chat</h3>
+                    <p class="text-white/50 text-sm">Discuss strategy inside each calendar event - no more scattered messages across apps.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- All Screens -->
+        <div class="bg-white/5 rounded-2xl p-8 mb-8 backdrop-blur-sm border border-white/10">
+            <h2 class="text-2xl font-semibold mb-6 flex items-center gap-3">
+                <span class="text-2xl">📱</span>
+                <span class="accent">All 25+ Screens</span>
+            </h2>
+            
+            <div class="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
+                <!-- Auth -->
+                <div class="bg-white/5 rounded-xl p-4">
+                    <h3 class="font-semibold text-[#E0B973] mb-3">🔐 Auth</h3>
+                    <ul class="text-white/70 text-sm space-y-2">
+                        <li>• Login + Role Select</li>
+                    </ul>
+                </div>
+
+                <!-- Senior -->
+                <div class="bg-white/5 rounded-xl p-4">
+                    <h3 class="font-semibold text-[#E0B973] mb-3">👔 Senior (10)</h3>
+                    <ul class="text-white/70 text-sm space-y-1">
+                        <li>• Dashboard + Tools</li>
+                        <li>• Case List & Detail</li>
+                        <li>• Task Management</li>
+                        <li>• Shared Calendar</li>
+                        <li>• Document Vault</li>
+                        <li>• Approvals & Workload</li>
+                        <li>• Assignments Panel</li>
+                        <li>• Settings</li>
+                    </ul>
+                </div>
+
+                <!-- Junior -->
+                <div class="bg-white/5 rounded-xl p-4">
+                    <h3 class="font-semibold text-[#E0B973] mb-3">👤 Junior (7)</h3>
+                    <ul class="text-white/70 text-sm space-y-1">
+                        <li>• Dashboard + Tools</li>
+                        <li>• My Tasks & Cases</li>
+                        <li>• Courtroom SOS</li>
+                        <li>• Firm Calendar</li>
+                        <li>• Limitation Calc</li>
+                        <li>• Doc Generator</li>
+                        <li>• Settings</li>
+                    </ul>
+                </div>
+
+                <!-- Client -->
+                <div class="bg-white/5 rounded-xl p-4">
+                    <h3 class="font-semibold text-[#E0B973] mb-3">💼 Client (8)</h3>
+                    <ul class="text-white/70 text-sm space-y-1">
+                        <li>• Dashboard</li>
+                        <li>• My Cases & Progress</li>
+                        <li>• Documents</li>
+                        <li>• Hearing Calendar</li>
+                        <li>• Lawyer Contact</li>
+                        <li>• Notifications</li>
+                        <li>• Settings</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- New Synapse Screens -->
+            <div class="mt-6 pt-6 border-t border-white/10">
+                <h3 class="font-semibold text-[#E0B973] mb-4">🚀 New Synapse Screens</h3>
+                <div class="grid md:grid-cols-3 gap-4">
+                    <div class="flex items-center gap-3 bg-blue-500/10 rounded-lg p-3">
+                        <span class="text-xl">📅</span>
+                        <div>
+                            <div class="font-medium text-sm">Shared Firm Calendar</div>
+                            <div class="text-xs text-white/50">TimeTree-style with chat</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 bg-purple-500/10 rounded-lg p-3">
+                        <span class="text-xl">💬</span>
+                        <div>
+                            <div class="font-medium text-sm">Event Chat</div>
+                            <div class="text-xs text-white/50">Contextual discussions</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 bg-green-500/10 rounded-lg p-3">
+                        <span class="text-xl">📋</span>
+                        <div>
+                            <div class="font-medium text-sm">Assignments</div>
+                            <div class="text-xs text-white/50">Dual-tier work system</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 bg-red-500/10 rounded-lg p-3">
+                        <span class="text-xl">🆘</span>
+                        <div>
+                            <div class="font-medium text-sm">Courtroom SOS</div>
+                            <div class="text-xs text-white/50">Emergency alerts</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 bg-orange-500/10 rounded-lg p-3">
+                        <span class="text-xl">⏱️</span>
+                        <div>
+                            <div class="font-medium text-sm">Limitation Calculator</div>
+                            <div class="text-xs text-white/50">Auto deadline calc</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 bg-pink-500/10 rounded-lg p-3">
+                        <span class="text-xl">📄</span>
+                        <div>
+                            <div class="font-medium text-sm">Document Generator</div>
+                            <div class="text-xs text-white/50">One-tap legal docs</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- How to Run -->
+        <div class="bg-white/5 rounded-2xl p-8 mb-8 backdrop-blur-sm border border-white/10">
+            <h2 class="text-2xl font-semibold mb-6 flex items-center gap-3">
+                <span class="text-2xl">🚀</span>
+                <span class="accent">How to Run</span>
+            </h2>
+
+            <div class="space-y-4">
+                <div class="code-block p-4 pt-10">
+                    <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    <code class="text-green-400">cd path/to/Synapse</code>
+                </div>
+                <div class="code-block p-4 pt-10">
+                    <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    <code class="text-green-400">flutter pub get</code>
+                </div>
+                <div class="code-block p-4 pt-10">
+                    <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    <code class="text-green-400">flutter run -d chrome</code>
+                </div>
+            </div>
+
+            <div class="mt-6 p-4 bg-blue-500/10 border border-blue-500/20 rounded-xl">
+                <h4 class="font-medium text-blue-400 mb-2">📡 Share with Friends (Same Wi-Fi)</h4>
+                <div class="code-block p-4 pt-10 mt-3">
+                    <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+                    <code class="text-green-400">flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8080</code>
+                </div>
+                <p class="text-white/50 text-sm mt-3">Then open <code class="bg-white/10 px-2 py-1 rounded">http://YOUR_IP:8080</code> on any device!</p>
+            </div>
+        </div>
+
+        <!-- Navigation Guide -->
+        <div class="bg-white/5 rounded-2xl p-8 mb-8 backdrop-blur-sm border border-white/10">
+            <h2 class="text-2xl font-semibold mb-6 flex items-center gap-3">
+                <span class="text-2xl">🧭</span>
+                <span class="accent">Navigation Guide</span>
+            </h2>
+            
+            <div class="space-y-4">
+                <div class="bg-blue-500/10 border border-blue-500/20 rounded-xl p-4">
+                    <h4 class="font-medium text-blue-400 mb-2">👔 Senior Lawyer</h4>
+                    <p class="text-white/60 text-sm">Dashboard → Synapse Tools section → Calendar, Limitation Calc, Doc Generator, Assignments</p>
+                </div>
+
+                <div class="bg-purple-500/10 border border-purple-500/20 rounded-xl p-4">
+                    <h4 class="font-medium text-purple-400 mb-2">👤 Junior Lawyer</h4>
+                    <p class="text-white/60 text-sm">Dashboard → Quick Tools section → <strong>Courtroom SOS</strong>, Firm Calendar, Limitation Calc, Doc Generator</p>
+                </div>
+
+                <div class="bg-green-500/10 border border-green-500/20 rounded-xl p-4">
+                    <h4 class="font-medium text-green-400 mb-2">💼 Client</h4>
+                    <p class="text-white/60 text-sm">Dashboard → Case card → Progress timeline → Documents, Calendar, Lawyer Contact</p>
+                </div>
+
+                <div class="bg-yellow-500/10 border border-yellow-500/20 rounded-xl p-4">
+                    <h4 class="font-medium text-yellow-400 mb-2">📅 Shared Calendar (TimeTree)</h4>
+                    <p class="text-white/60 text-sm">Senior Dashboard → Calendar button OR Junior → Firm Calendar button → Tap any event to open contextual chat</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="text-center mt-12 text-white/40 text-sm">
+            <p class="text-lg font-semibold text-white/60 mb-2">Synapse</p>
+            <p>The Smart Litigation Management System</p>
+            <p class="mt-2">Built with Flutter 💙 | TimeTree-Inspired Collaboration</p>
+        </div>
+    </div>
+
+    <script>
+        function copyCode(btn) {
+            const code = btn.parentElement.querySelector('code').textContent;
+            navigator.clipboard.writeText(code);
+            btn.textContent = 'Copied!';
+            setTimeout(() => btn.textContent = 'Copy', 2000);
+        }
+    </script>
+</body>
+</html>
