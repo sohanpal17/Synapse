@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -752,21 +753,26 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
       });
   }
 
-  void _listenToFirestore() {
-    _sub = FirestoreService().watchChatGroups().listen((data) async {
-      final writes = <Future<void>>[];
-      for (final m in data) {
-        final id = m['id'] as String? ?? '';
-        if (id.isNotEmpty) {
-          writes.add(HiveService.put(HiveService.chatGroupsBox, id, m));
-        }
-      }
-      if (writes.isNotEmpty) {
-        await Future.wait(writes);
-      }
-      _loadFromHive();
-    }, onError: (_) {});
+  void _listenToFirestore() { final uid = _currentUid; if (uid.isEmpty) return;
+
+_sub = FirestoreService().watchChatGroups(uid).listen((data) async {
+  final writes = <Future<void>>[];
+
+  for (final m in data) {
+    final id = m['id'] as String? ?? '';
+    if (id.isNotEmpty) {
+      writes.add(HiveService.put(HiveService.chatGroupsBox, id, m));
+    }
   }
+
+  if (writes.isNotEmpty) {
+    await Future.wait(writes);
+  }
+
+  _loadFromHive();
+}, onError: (_) {});
+
+}
 
   Future<void> addChatGroup(ChatGroup g) async {
     final uid = _currentUid;
@@ -788,42 +794,32 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
     _loadFromHive();
   }
 
-  Future<void> deleteChatGroup(String id) async {
-    await HiveService.delete(HiveService.chatGroupsBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'chatGroups',
-      documentId: id,
-      data: {},
-    );
-    _loadFromHive();
-  }
 
-  Future<void> updateChatGroup(ChatGroup g) async {
-    final map = g.toMap();
-    final members = <String>{...List<String>.from(map['memberIds'] ?? const [])};
-    if (g.createdBy.isNotEmpty) {
-      members.add(g.createdBy);
-    }
-    map['memberIds'] = members.toList();
-    map['participantIds'] = members.toList();
-    map['updatedAt'] = DateTime.now().toIso8601String();
 
-    await HiveService.put(HiveService.chatGroupsBox, g.id, map);
-    await SyncService.queueAction(
-      action: 'UPDATE',
-      collection: 'chatGroups',
-      documentId: g.id,
-      data: map,
-    );
-    _loadFromHive();
-  }
+ Future<void> deleteChatGroup(String id) async { // 🔥 Immediate Firestore delete await FirebaseFirestore.instance .collection('chatGroups') .doc(id) .delete();
 
-  void refresh() => _loadFromHive();
+await HiveService.delete(HiveService.chatGroupsBox, id);
 
-  @override
-  void dispose() {
-    _sub?.cancel();
-    super.dispose();
-  }
+await SyncService.queueAction(
+  action: 'DELETE',
+  collection: 'chatGroups',
+  documentId: id,
+  data: {},
+);
+
+_loadFromHive();
+
 }
+Future<void> updateChatGroup(ChatGroup g) async {
+  final map = g.toMap();
+
+  await FirebaseFirestore.instance
+      .collection('chatGroups')
+      .doc(g.id)
+      .set(map);
+
+  await HiveService.put(HiveService.chatGroupsBox, g.id, map);
+
+  _loadFromHive();
+}
+@override void dispose() { _sub?.cancel(); super.dispose(); } }

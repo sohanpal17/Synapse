@@ -15,6 +15,8 @@ import '../services/firestore_service.dart';
 const int _maxUploadBytes = 25 * 1024 * 1024;
 
 // ==================== MESSENGER SCREEN ====================
+// ✅ UPDATED: MessengerScreen with proper user-based filtering
+
 class MessengerScreen extends ConsumerStatefulWidget {
   const MessengerScreen({super.key});
 
@@ -34,12 +36,20 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
     final canCreateChat = currentUser?.role != 'client';
     final chatGroups = ref.watch(chatGroupsProvider);
     final members = ref.watch(firmMembersProvider).valueOrNull ?? const [];
+
+    // ✅ FIX: Filter chats ONLY for current user
     final visibleChatGroups = chatGroups.where((g) {
+      if (currentUser == null) return false;
+
+      // 🔥 CRITICAL FIX: Only show chats where user is a member
+      final isMember = g.memberIds.contains(currentUser.uid);
+
       final hasCaseId = (g.caseId ?? '').trim().isNotEmpty;
       final isCaseChatId = g.id.startsWith('case_chat_');
       final isCaseChatDesc =
           (g.description ?? '').toLowerCase().contains('case chat:');
-      return !hasCaseId && !isCaseChatId && !isCaseChatDesc;
+
+      return isMember && !hasCaseId && !isCaseChatId && !isCaseChatDesc;
     }).toList();
 
     return Scaffold(
@@ -81,6 +91,8 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
               ],
             ),
           ),
+
+          // Chat List
           Expanded(
             child: visibleChatGroups.isEmpty
                 ? Center(
@@ -105,17 +117,6 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
                               color: Colors.grey[600],
                             ),
                           ),
-                          const SizedBox(height: 8),
-                          Text(
-                            canCreateChat
-                                ? 'Create a new chat to start messaging'
-                                : 'A lawyer or intern will start the chat.\nYou can continue the conversation here.',
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: Colors.grey[500],
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
                         ],
                       ),
                     ),
@@ -125,18 +126,24 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
                     itemCount: visibleChatGroups.length,
                     itemBuilder: (context, index) {
                       final chatGroup = visibleChatGroups[index];
-                      final user = ref.read(currentUserProvider);
+                      final user = currentUser;
+
                       String? directMemberRole;
                       if (chatGroup.memberCount == 2 && user != null) {
-                        final otherId = chatGroup.memberIds
-                            .firstWhere((id) => id != user.uid, orElse: () => '');
+                        final otherId = chatGroup.memberIds.firstWhere(
+                          (id) => id != user.uid,
+                          orElse: () => '',
+                        );
+
                         if (otherId.isNotEmpty) {
                           final match = members.where((m) => m.uid == otherId);
                           if (match.isNotEmpty) {
-                            directMemberRole = _formatRoleLabel(match.first.role);
+                            directMemberRole =
+                                _formatRoleLabel(match.first.role);
                           }
                         }
                       }
+
                       return ChatGroupCard(
                         chatGroup: chatGroup,
                         currentUserId: user?.uid,
@@ -157,6 +164,7 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
           ),
         ],
       ),
+
       floatingActionButton: canCreateChat
           ? FloatingActionButton.extended(
               onPressed: () {
@@ -172,13 +180,35 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
               label: const Text(
                 'New Chat',
                 style: TextStyle(
-                    color: AppColors.primary, fontWeight: FontWeight.w600),
+                  color: AppColors.primary,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             )
           : null,
     );
   }
 }
+
+// 🔥 ALSO IMPORTANT (add in your FirestoreService or provider)
+
+// When fetching chatGroups from Firestore, use:
+
+/*
+FirebaseFirestore.instance
+  .collection('chatGroups')
+  .where('memberIds', arrayContains: currentUserId)
+*/
+
+// And when deleting chat, ensure:
+
+/*
+await FirebaseFirestore.instance
+  .collection('chatGroups')
+  .doc(chatId)
+  .delete();
+*/
+
 
 // ==================== CREATE CHAT SCREEN ====================
 class CreateChatScreen extends ConsumerStatefulWidget {
