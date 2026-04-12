@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/user_model.dart';
 import '../models/case_model.dart';
 import '../models/reminder_models.dart';
@@ -18,6 +19,17 @@ final authServiceProvider = Provider((_) => AuthService());
 final firestoreServiceProvider = Provider((_) => FirestoreService());
 final syncServiceProvider = Provider((_) => SyncService());
 
+String _normalizeWorkStatus(dynamic raw) {
+  final status = (raw ?? '').toString().trim().toLowerCase();
+  if (status == 'completed' ||
+      status == 'complete' ||
+      status == 'done' ||
+      status == 'closed') {
+    return 'completed';
+  }
+  return 'inProgress';
+}
+
 // ══════════ AUTH STATE ══════════
 final authStateProvider = StreamProvider<User?>((ref) {
   return FirebaseAuth.instance.authStateChanges();
@@ -32,6 +44,7 @@ final currentUserProvider =
 class CurrentUserNotifier extends StateNotifier<UserModel?> {
   final AuthService _authService;
   StreamSubscription<User?>? _authSub;
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _profileSub;
 
   CurrentUserNotifier(this._authService) : super(null) {
     _loadCachedUser();
@@ -49,17 +62,36 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
   }
 
   Future<void> _handleAuthChanged(User? fbUser) async {
+    await _profileSub?.cancel();
+    _profileSub = null;
+
     if (fbUser == null) {
       state = null;
       return;
     }
 
-    final currentState = state;
-
     final cached = _authService.getCachedUser();
     if (cached != null && cached.uid == fbUser.uid) {
       state = cached;
     }
+
+    // Keep profile in sync so pending/approved transitions are reflected live.
+    _profileSub = FirebaseFirestore.instance
+        .collection('users')
+        .doc(fbUser.uid)
+        .snapshots()
+        .listen((doc) async {
+      if (!doc.exists) return;
+      final map = doc.data();
+      if (map == null) return;
+      final normalized = Map<String, dynamic>.from(map);
+      normalized.putIfAbsent('uid', () => doc.id);
+      final remote = UserModel.fromMap(normalized);
+      await HiveService.put(HiveService.userBox, 'current_user', remote.toMap());
+      state = remote;
+    }, onError: (e) {
+      debugPrint('Failed profile stream for ${fbUser.uid}: $e');
+    });
 
     try {
       final remote = await _authService.getUserById(fbUser.uid);
@@ -72,19 +104,8 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
       debugPrint('Failed to fetch profile for auth user ${fbUser.uid}: $e');
     }
 
-    if (currentState != null && currentState.uid == fbUser.uid) {
-      state = currentState;
-      return;
-    }
-
-    // Avoid creating a phantom default-role profile. If no reliable profile exists,
-    // force sign-out so the app returns to Login instead of opening wrong dashboards.
-    try {
-      await FirebaseAuth.instance.signOut();
-    } catch (e) {
-      debugPrint('Failed to sign out after missing profile: $e');
-    }
-    state = null;
+    // Do not force sign-out here. Registration writes may still be in progress.
+    // Keep current state (cached or null) and let profile stream resolve.
   }
 
   void setUser(UserModel user) => state = user;
@@ -92,6 +113,7 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
 
   @override
   void dispose() {
+    _profileSub?.cancel();
     _authSub?.cancel();
     super.dispose();
   }
@@ -218,7 +240,11 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
 
   void refresh() => _loadFromHive();
 
-  Future<void> updateCase(String cino, Map<String, dynamic> updates) async {
+  Future<void> updateCase(
+    String cino,
+    Map<String, dynamic> updates, {
+    bool queueSync = true,
+  }) async {
     final existing = HiveService.get(HiveService.casesBox, cino);
     if (existing != null) {
       existing['ownerUid'] = _currentUid;
@@ -226,12 +252,14 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
       existing['participantIds'] = _computeCaseParticipants(existing);
       existing['updatedAt'] = DateTime.now().toIso8601String();
       await HiveService.put(HiveService.casesBox, cino, existing);
-      await SyncService.queueAction(
-        action: 'UPDATE',
-        collection: 'cases',
-        documentId: cino,
-        data: existing,
-      );
+      if (queueSync) {
+        await SyncService.queueAction(
+          action: 'UPDATE',
+          collection: 'cases',
+          documentId: cino,
+          data: existing,
+        );
+      }
       _loadFromHive();
     }
   }
@@ -307,9 +335,13 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     state = all.where((t) {
       final participants = List<String>.from(t['participantIds'] ?? const []);
       final assigned = List<String>.from(t['assignedJuniorIds'] ?? const []);
+      final assignedMany = List<String>.from(t['assignedToIds'] ?? const []);
+      final assignedSingle = (t['assignedToId'] ?? '').toString();
       final isOwner = t['createdBy'] == uid;
       final isPublic = t['isPublic'] == true || t['visibility'] == 'everyone';
-      final isAssigned = assigned.contains(uid);
+      final isAssigned = assigned.contains(uid) ||
+          assignedMany.contains(uid) ||
+          assignedSingle == uid;
 
       // Keep legacy-safe visibility checks so assigned interns still see tasks
       // even when participantIds are stale or missing.
@@ -324,12 +356,36 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   void _listenToFirestore() {
     _sub = FirestoreService().watchTasks().listen((data) async {
       final writes = <Future<void>>[];
+      final incomingIds = <String>{};
       for (final m in data) {
         final id = m['id'] as String? ?? '';
         if (id.isNotEmpty) {
-          writes.add(HiveService.put(HiveService.tasksBox, id, m));
+          incomingIds.add(id);
+          final normalized = Map<String, dynamic>.from(m)
+            ..['status'] = _normalizeWorkStatus(m['status']);
+          writes.add(HiveService.put(HiveService.tasksBox, id, normalized));
         }
       }
+
+      // Remove stale task rows (for example after creator deletes a task)
+      // while preserving pending local creates that are not yet on server.
+      final queue = HiveService.getSyncQueue();
+      final pendingCreateIds = queue
+          .where((q) =>
+              (q['collection'] ?? '') == 'tasks' &&
+              (q['action'] ?? '') == 'CREATE')
+          .map((q) => (q['documentId'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      final visibleIds = state
+          .map((t) => (t['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      for (final staleId in visibleIds.difference(incomingIds)) {
+        if (pendingCreateIds.contains(staleId)) continue;
+        writes.add(HiveService.delete(HiveService.tasksBox, staleId));
+      }
+
       if (writes.isNotEmpty) {
         await Future.wait(writes);
       }
@@ -343,9 +399,12 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     final participants = <String>{
       uid,
       ...List<String>.from(task['assignedJuniorIds'] ?? const []),
+      ...List<String>.from(task['assignedToIds'] ?? const []),
+      (task['assignedToId'] ?? '').toString(),
     }..removeWhere((e) => e.trim().isEmpty);
     final local = Map<String, dynamic>.from(task)
-      ..['participantIds'] = participants.toList();
+      ..['participantIds'] = participants.toList()
+      ..['status'] = _normalizeWorkStatus(task['status']);
 
     await HiveService.put(HiveService.tasksBox, task['id'], local);
     await SyncService.queueAction(
@@ -360,34 +419,84 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   Future<void> updateTask(String id, Map<String, dynamic> updates) async {
     final existing = HiveService.get(HiveService.tasksBox, id);
     if (existing != null) {
-      existing.addAll(updates);
-      final participants = <String>{
-        _currentUid,
-        ...List<String>.from(existing['participantIds'] ?? const []),
-        ...List<String>.from(existing['assignedJuniorIds'] ?? const []),
-      }..removeWhere((e) => e.trim().isEmpty);
-      existing['participantIds'] = participants.toList();
+      final normalizedUpdates = Map<String, dynamic>.from(updates);
+      if (normalizedUpdates.containsKey('status')) {
+        normalizedUpdates['status'] =
+            _normalizeWorkStatus(normalizedUpdates['status']);
+      }
+
+      existing.addAll(normalizedUpdates);
       existing['updatedAt'] = DateTime.now().toIso8601String();
+      final updatePayload = <String, dynamic>{
+        ...normalizedUpdates,
+        'updatedAt': existing['updatedAt'],
+      };
       await HiveService.put(HiveService.tasksBox, id, existing);
-      await SyncService.queueAction(
-        action: 'UPDATE',
-        collection: 'tasks',
-        documentId: id,
-        data: existing,
-      );
+
+      final isStatusOnly = normalizedUpdates.containsKey('status') &&
+          normalizedUpdates.keys.every((k) => k == 'status' || k == 'updatedAt');
+
+      if (isStatusOnly) {
+        try {
+          await FirestoreService().updateTaskStatus(
+            id,
+            (normalizedUpdates['status'] ?? 'pending').toString(),
+          );
+        } catch (e) {
+          await SyncService.queueAction(
+            action: 'UPDATE',
+            collection: 'tasks',
+            documentId: id,
+            data: updatePayload,
+          );
+          debugPrint('Task status callable failed; queued sync fallback: $e');
+        }
+      } else {
+        try {
+          await FirestoreService().updateTaskDetails(id, updatePayload);
+        } catch (e) {
+          final text = e.toString().toLowerCase();
+          final isRetryable = text.contains('unavailable') ||
+              text.contains('deadline-exceeded') ||
+              text.contains('network') ||
+              text.contains('timeout') ||
+              text.contains('internal');
+          if (!isRetryable) rethrow;
+
+          await SyncService.queueAction(
+            action: 'UPDATE',
+            collection: 'tasks',
+            documentId: id,
+            data: updatePayload,
+          );
+          debugPrint('Task detail callable failed; queued sync fallback: $e');
+        }
+      }
       _load();
     }
   }
 
   Future<void> deleteTask(String id) async {
+    final uid = _currentUid;
+    final existing = HiveService.get(HiveService.tasksBox, id);
+    if (existing == null) return;
+    final isCreator = (existing['createdBy'] ?? '').toString() == uid;
+    if (!isCreator) return;
+
     await HiveService.delete(HiveService.tasksBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'tasks',
-      documentId: id,
-      data: {},
-    );
     _load();
+
+    try {
+      await FirestoreService().deleteTaskSecure(id);
+    } catch (e) {
+      await SyncService.queueAction(
+        action: 'DELETE',
+        collection: 'tasks',
+        documentId: id,
+        data: {},
+      );
+      debugPrint('Task delete callable failed; queued delete fallback: $e');
+    }
   }
 
   void refresh() => _load();
@@ -458,12 +567,36 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   void _listenToFirestore() {
     _sub = FirestoreService().watchAssignments().listen((data) async {
       final writes = <Future<void>>[];
+      final incomingIds = <String>{};
       for (final m in data) {
         final id = m['id'] as String? ?? '';
         if (id.isNotEmpty) {
-          writes.add(HiveService.put(HiveService.assignmentsBox, id, m));
+          incomingIds.add(id);
+          final normalized = Map<String, dynamic>.from(m)
+            ..['status'] = _normalizeWorkStatus(m['status']);
+          writes.add(
+            HiveService.put(HiveService.assignmentsBox, id, normalized),
+          );
         }
       }
+
+      final queue = HiveService.getSyncQueue();
+      final pendingCreateIds = queue
+          .where((q) =>
+              (q['collection'] ?? '') == 'assignments' &&
+              (q['action'] ?? '') == 'CREATE')
+          .map((q) => (q['documentId'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      final visibleIds = state
+          .map((a) => (a['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      for (final staleId in visibleIds.difference(incomingIds)) {
+        if (pendingCreateIds.contains(staleId)) continue;
+        writes.add(HiveService.delete(HiveService.assignmentsBox, staleId));
+      }
+
       if (writes.isNotEmpty) {
         await Future.wait(writes);
       }
@@ -485,7 +618,8 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     }..removeWhere((e) => e.isEmpty);
 
     final local = Map<String, dynamic>.from(assignment)
-      ..['participantIds'] = participants.toList();
+      ..['participantIds'] = participants.toList()
+      ..['status'] = _normalizeWorkStatus(assignment['status']);
 
     await HiveService.put(HiveService.assignmentsBox, id, local);
     await SyncService.queueAction(
@@ -501,34 +635,84 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     final existing = HiveService.get(HiveService.assignmentsBox, id);
     if (existing == null) return;
 
-    existing.addAll(updates);
-    final assignees = _assignmentAssigneeIds(existing);
-    final participants = <String>{
-      _currentUid,
-      ...assignees,
-      ...List<String>.from(existing['participantIds'] ?? const []),
-    }..removeWhere((e) => e.isEmpty);
-    existing['participantIds'] = participants.toList();
+    final normalizedUpdates = Map<String, dynamic>.from(updates);
+    if (normalizedUpdates.containsKey('status')) {
+      normalizedUpdates['status'] =
+          _normalizeWorkStatus(normalizedUpdates['status']);
+    }
+
+    existing.addAll(normalizedUpdates);
     existing['updatedAt'] = DateTime.now().toIso8601String();
+    final updatePayload = <String, dynamic>{
+      ...normalizedUpdates,
+      'updatedAt': existing['updatedAt'],
+    };
     await HiveService.put(HiveService.assignmentsBox, id, existing);
-    await SyncService.queueAction(
-      action: 'UPDATE',
-      collection: 'assignments',
-      documentId: id,
-      data: existing,
-    );
+
+    final isStatusOnly = normalizedUpdates.containsKey('status') &&
+        normalizedUpdates.keys.every((k) => k == 'status' || k == 'updatedAt');
+
+    if (isStatusOnly) {
+      try {
+        await FirestoreService().updateAssignmentStatus(
+          id,
+          (normalizedUpdates['status'] ?? 'pending').toString(),
+        );
+      } catch (e) {
+        await SyncService.queueAction(
+          action: 'UPDATE',
+          collection: 'assignments',
+          documentId: id,
+          data: updatePayload,
+        );
+        debugPrint('Assignment status callable failed; queued sync fallback: $e');
+      }
+    } else {
+      try {
+        await FirestoreService().updateAssignmentDetails(id, updatePayload);
+      } catch (e) {
+        final text = e.toString().toLowerCase();
+        final isRetryable = text.contains('unavailable') ||
+            text.contains('deadline-exceeded') ||
+            text.contains('network') ||
+            text.contains('timeout') ||
+            text.contains('internal');
+        if (!isRetryable) rethrow;
+
+        await SyncService.queueAction(
+          action: 'UPDATE',
+          collection: 'assignments',
+          documentId: id,
+          data: updatePayload,
+        );
+        debugPrint(
+            'Assignment detail callable failed; queued sync fallback: $e');
+      }
+    }
     _loadFromHive();
   }
 
   Future<void> deleteAssignment(String id) async {
+    final uid = _currentUid;
+    final existing = HiveService.get(HiveService.assignmentsBox, id);
+    if (existing == null) return;
+    final isCreator = (existing['createdBy'] ?? '').toString() == uid;
+    if (!isCreator) return;
+
     await HiveService.delete(HiveService.assignmentsBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'assignments',
-      documentId: id,
-      data: {},
-    );
     _loadFromHive();
+
+    try {
+      await FirestoreService().deleteAssignmentSecure(id);
+    } catch (e) {
+      await SyncService.queueAction(
+        action: 'DELETE',
+        collection: 'assignments',
+        documentId: id,
+        data: {},
+      );
+      debugPrint('Assignment delete callable failed; queued delete fallback: $e');
+    }
   }
 
   void refresh() => _loadFromHive();
@@ -548,6 +732,13 @@ final firmMembersProvider = StreamProvider<List<UserModel>>((ref) {
   return ref.read(authServiceProvider).watchFirmMembers().map(
         (members) => members.where((m) => m.uid != user.uid).toList(),
       );
+});
+
+final cachedFirmMembersProvider = Provider<List<UserModel>>((ref) {
+  final user = ref.watch(currentUserProvider);
+  if (user == null) return const [];
+  final members = ref.read(authServiceProvider).getCachedFirmMembers();
+  return members.where((m) => m.uid != user.uid).toList();
 });
 
 // ══════════ SOS ALERTS ══════════
@@ -605,6 +796,7 @@ class RemindersNotifier extends StateNotifier<List<Reminder>> {
 
   Future<void> addReminder(Reminder r) async {
     final map = r.toMap();
+    map['participantIds'] = <String>{r.createdBy, ...r.sharedWithUserIds}.toList();
     await HiveService.put(HiveService.remindersBox, r.id, map);
     await SyncService.queueAction(
       action: 'CREATE',
@@ -617,6 +809,7 @@ class RemindersNotifier extends StateNotifier<List<Reminder>> {
 
   Future<void> updateReminder(Reminder r) async {
     final map = r.toMap();
+    map['participantIds'] = <String>{r.createdBy, ...r.sharedWithUserIds}.toList();
     await HiveService.put(HiveService.remindersBox, r.id, map);
     await SyncService.queueAction(
       action: 'UPDATE',
@@ -628,13 +821,57 @@ class RemindersNotifier extends StateNotifier<List<Reminder>> {
   }
 
   Future<void> deleteReminder(String id) async {
+    final currentUid = FirebaseAuth.instance.currentUser?.uid ?? '';
+
+    String creatorUid = '';
+    for (final reminder in state) {
+      if (reminder.id == id) {
+        creatorUid = reminder.createdBy;
+        break;
+      }
+    }
+
+    if (creatorUid.isEmpty) {
+      final cached = HiveService.get(HiveService.remindersBox, id);
+      if (cached is Map) {
+        final cachedMap = cached as Map<dynamic, dynamic>;
+        creatorUid = (cachedMap['createdBy'] ?? '').toString();
+      }
+    }
+
+    if (creatorUid.isEmpty || creatorUid != currentUid) {
+      throw Exception('Reminder can only be deleted by the creator of this reminder');
+    }
+
+    bool deletedInCloud = false;
+    try {
+      await FirestoreService().deleteDocument('reminders', id);
+      deletedInCloud = true;
+    } catch (e) {
+      final text = e.toString().toLowerCase();
+      final isPermissionError = text.contains('permission-denied') ||
+          text.contains('missing or insufficient permissions') ||
+          text.contains('unauthenticated');
+
+      if (isPermissionError) {
+        throw Exception('Reminder can only be deleted by the creator of this reminder');
+      }
+
+      // Offline/transient failure: keep UI responsive and sync later.
+      await SyncService.queueAction(
+        action: 'DELETE',
+        collection: 'reminders',
+        documentId: id,
+        data: {},
+        skipImmediateSync: true,
+      );
+    }
+
+    if (!deletedInCloud) {
+      // Deletion is queued and will complete when connectivity is restored.
+    }
+
     await HiveService.delete(HiveService.remindersBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'reminders',
-      documentId: id,
-      data: {},
-    );
     _loadFromHive();
   }
 
@@ -658,10 +895,26 @@ final noticesProvider =
 
 class NoticesNotifier extends StateNotifier<List<Notice>> {
   StreamSubscription? _sub;
+  StreamSubscription<User?>? _authSub;
+  final Set<String> _pendingDeleteNoticeIds = <String>{};
+
+  bool _isRetryableSyncError(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('unavailable') ||
+        text.contains('deadline-exceeded') ||
+        text.contains('network') ||
+        text.contains('timeout') ||
+        text.contains('internal');
+  }
 
   NoticesNotifier() : super([]) {
     _loadFromHive();
     _listenToFirestore();
+    _authSub = FirebaseAuth.instance.authStateChanges().listen((_) {
+      _sub?.cancel();
+      _loadFromHive();
+      _listenToFirestore();
+    });
   }
 
   void _loadFromHive() {
@@ -673,39 +926,73 @@ class NoticesNotifier extends StateNotifier<List<Notice>> {
   void _listenToFirestore() {
     _sub = FirestoreService().watchNotices().listen((data) async {
       final writes = <Future<void>>[];
+      final incomingIds = <String>{};
       for (final m in data) {
         final id = m['id'] as String? ?? '';
         if (id.isNotEmpty) {
+          incomingIds.add(id);
+        }
+        if (id.isNotEmpty && !_pendingDeleteNoticeIds.contains(id)) {
           writes.add(HiveService.put(HiveService.noticesBox, id, m));
         }
       }
+
+      // Once cloud no longer returns an item, consider local delete fully settled.
+      _pendingDeleteNoticeIds.removeWhere((id) => !incomingIds.contains(id));
+
       if (writes.isNotEmpty) {
         await Future.wait(writes);
       }
       _loadFromHive();
-    }, onError: (_) {});
+    }, onError: (e) {
+      debugPrint('Notice stream failed: $e');
+    });
   }
 
   Future<void> addNotice(Notice n) async {
     final map = n.toMap();
     await HiveService.put(HiveService.noticesBox, n.id, map);
-    await SyncService.queueAction(
-      action: 'CREATE',
-      collection: 'notices',
-      documentId: n.id,
-      data: map,
-    );
+    try {
+      await FirestoreService().upsertNoticeSecure(map);
+    } catch (e) {
+      if (_isRetryableSyncError(e)) {
+        await SyncService.queueAction(
+          action: 'CREATE',
+          collection: 'notices',
+          documentId: n.id,
+          data: map,
+        );
+      } else {
+        rethrow;
+      }
+    }
     _loadFromHive();
   }
 
   Future<void> deleteNotice(String id) async {
+    final existing = HiveService.get(HiveService.noticesBox, id);
+    _pendingDeleteNoticeIds.add(id);
     await HiveService.delete(HiveService.noticesBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'notices',
-      documentId: id,
-      data: {},
-    );
+    _loadFromHive();
+    try {
+      await FirestoreService().deleteNoticeSecure(id);
+    } catch (e) {
+      if (_isRetryableSyncError(e)) {
+        await SyncService.queueAction(
+          action: 'DELETE',
+          collection: 'notices',
+          documentId: id,
+          data: {},
+        );
+      } else {
+        _pendingDeleteNoticeIds.remove(id);
+        if (existing != null) {
+          await HiveService.put(HiveService.noticesBox, id, existing);
+        }
+        _loadFromHive();
+        rethrow;
+      }
+    }
     _loadFromHive();
   }
 
@@ -714,6 +1001,7 @@ class NoticesNotifier extends StateNotifier<List<Notice>> {
   @override
   void dispose() {
     _sub?.cancel();
+    _authSub?.cancel();
     super.dispose();
   }
 }
@@ -734,6 +1022,19 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
     _listenToFirestore();
   }
 
+  dynamic _sanitizeForHive(dynamic value) {
+    if (value is Timestamp) {
+      return value.toDate().toIso8601String();
+    }
+    if (value is Map) {
+      return value.map((k, v) => MapEntry(k, _sanitizeForHive(v)));
+    }
+    if (value is List) {
+      return value.map(_sanitizeForHive).toList();
+    }
+    return value;
+  }
+
   void _loadFromHive() {
     final uid = _currentUid;
     final cached = HiveService.getAll(HiveService.chatGroupsBox);
@@ -741,7 +1042,8 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
         .where((m) {
           if (uid.isEmpty) return false;
           final memberIds = List<String>.from(m['memberIds'] ?? const []);
-          return memberIds.contains(uid);
+          final hiddenFor = List<String>.from(m['hiddenForUserIds'] ?? const []);
+          return memberIds.contains(uid) && !hiddenFor.contains(uid);
         })
         .map((m) => ChatGroup.fromMap(m))
         .toList()
@@ -758,7 +1060,9 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
       for (final m in data) {
         final id = m['id'] as String? ?? '';
         if (id.isNotEmpty) {
-          writes.add(HiveService.put(HiveService.chatGroupsBox, id, m));
+          final safe =
+              Map<String, dynamic>.from(_sanitizeForHive(m) as Map);
+          writes.add(HiveService.put(HiveService.chatGroupsBox, id, safe));
         }
       }
       if (writes.isNotEmpty) {
@@ -778,24 +1082,35 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
     };
     map['memberIds'] = members.toList();
     map['participantIds'] = members.toList();
+    map['updatedAt'] = DateTime.now().toIso8601String();
     await HiveService.put(HiveService.chatGroupsBox, g.id, map);
-    await SyncService.queueAction(
-      action: 'CREATE',
-      collection: 'chatGroups',
-      documentId: g.id,
-      data: map,
-    );
+    await FirestoreService().upsertChatGroupSecure(map);
     _loadFromHive();
   }
 
-  Future<void> deleteChatGroup(String id) async {
+  Future<void> deleteChatForMe(String id) async {
     await HiveService.delete(HiveService.chatGroupsBox, id);
-    await SyncService.queueAction(
-      action: 'DELETE',
-      collection: 'chatGroups',
-      documentId: id,
-      data: {},
-    );
+    await FirestoreService().deleteChatForMeSecure(id);
+    _loadFromHive();
+  }
+
+  Future<void> deleteChatForEveryone(String id) async {
+    await HiveService.delete(HiveService.chatGroupsBox, id);
+    await FirestoreService().deleteChatForEveryoneSecure(id);
+    _loadFromHive();
+  }
+
+  Future<void> clearChatForMe(String id) async {
+    final existing = HiveService.get(HiveService.chatGroupsBox, id);
+    if (existing == null) return;
+    final uid = _currentUid;
+    if (uid.isEmpty) return;
+
+    final clearMap = Map<String, dynamic>.from(existing['clearedAtByUser'] ?? const {});
+    clearMap[uid] = DateTime.now().toIso8601String();
+    existing['clearedAtByUser'] = clearMap;
+    await HiveService.put(HiveService.chatGroupsBox, id, existing);
+    await FirestoreService().clearChatForMeSecure(id);
     _loadFromHive();
   }
 
@@ -810,12 +1125,7 @@ class ChatGroupsNotifier extends StateNotifier<List<ChatGroup>> {
     map['updatedAt'] = DateTime.now().toIso8601String();
 
     await HiveService.put(HiveService.chatGroupsBox, g.id, map);
-    await SyncService.queueAction(
-      action: 'UPDATE',
-      collection: 'chatGroups',
-      documentId: g.id,
-      data: map,
-    );
+    await FirestoreService().upsertChatGroupSecure(map);
     _loadFromHive();
   }
 

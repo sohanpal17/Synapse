@@ -16,12 +16,24 @@ import '../services/notification_service.dart';
 import '../services/pdf_service.dart';
 import '../services/ecourts_import_service.dart';
 import '../models/messaging_models.dart';
+import '../utils/date_formatter.dart';
 import 'messenger_screens.dart';
 import '../services/sync_service.dart';
 import 'calendar_screens.dart';
 
 const _uuid = Uuid();
 const int _maxUploadBytes = 25 * 1024 * 1024;
+
+String _normalizeWorkStatus(dynamic raw) {
+  final status = (raw ?? '').toString().trim().toLowerCase();
+  if (status == 'completed' ||
+      status == 'complete' ||
+      status == 'done' ||
+      status == 'closed') {
+    return 'completed';
+  }
+  return 'inProgress';
+}
 
 // ==================== LAWYER DASHBOARD ====================
 class LawyerDashboard extends ConsumerStatefulWidget {
@@ -31,13 +43,68 @@ class LawyerDashboard extends ConsumerStatefulWidget {
   ConsumerState<LawyerDashboard> createState() => _LawyerDashboardState();
 }
 
-class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
+class _LawyerDashboardState extends ConsumerState<LawyerDashboard> with WidgetsBindingObserver {
   int _currentNavIndex = 0;
   final Set<String> _seenSosAlertIds = <String>{};
   bool _showSosBlink = false;
   bool _blinkOn = false;
   Timer? _blinkTicker;
   Timer? _blinkStopper;
+  StreamSubscription<Map<String, dynamic>>? _sosBlinkSub;
+
+  // ══════════ SINGLE UNIFIED SOS HANDLER ══════════
+
+  /// The ONE method all SOS paths funnel into.
+  /// [sosId] – unique alert ID for dedup.
+  /// [sentBy] – UID of sender (skip if it's us).
+  /// [senderName], [caseName] – for snackbar display.
+  /// [isRecent] – false to skip (stale alert opened after 2 min).
+  void _handleSos({
+    required String sosId,
+    required String sentBy,
+    String senderName = 'Team member',
+    String caseName = 'Unknown case',
+    String courtRoom = '',
+    bool isRecent = true,
+  }) {
+    if (sosId.isEmpty) return;
+    if (_seenSosAlertIds.contains(sosId)) return;
+
+    // Skip stale alerts (older than 2 min).
+    if (!isRecent) return;
+
+    // Defer processing if app is not in the foreground.
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    final isForeground = lifecycleState == AppLifecycleState.resumed || lifecycleState == null;
+    if (!isForeground) return;
+
+    _seenSosAlertIds.add(sosId);
+
+    // Skip our own SOS.
+    final user = ref.read(currentUserProvider);
+    final currentUid = user?.uid ?? '';
+    if (sentBy.isNotEmpty && sentBy == currentUid) return;
+
+    // Skip if a blink is already active (don't stack).
+    if (_showSosBlink) return;
+
+    // ── Trigger blink and play sound together ──
+    _triggerSosBlink();
+    NotificationService.playSosNotificationAudioFor3Seconds();
+    NotificationService.markSosBlinkConsumed(sosId);
+
+    // ── Snackbar ──
+    if (mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('SOS received from $senderName ($caseName)'),
+          backgroundColor: AppColors.error,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
 
   void _triggerSosBlink() {
     _blinkTicker?.cancel();
@@ -63,6 +130,7 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
     });
   }
 
+  // ── Firestore stream path ──
   void _processSosAlerts(
     AsyncValue<List<Map<String, dynamic>>> alertsAsync,
     String currentUid,
@@ -70,42 +138,19 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
     alertsAsync.whenData((alerts) {
       for (final alert in alerts) {
         final id = (alert['id'] ?? '').toString();
-        if (id.isEmpty || _seenSosAlertIds.contains(id)) continue;
-
-        final timestampRaw = (alert['timestamp'] ?? '').toString();
-        final sentAt = DateTime.tryParse(timestampRaw);
+        final sentAt = DateFormatter.parseDateNullable(
+          alert['timestamp'] ?? alert['createdAt'],
+        );
         final isRecent = sentAt != null &&
             DateTime.now().difference(sentAt) <= const Duration(minutes: 2);
 
-        _seenSosAlertIds.add(id);
-
-        if (NotificationService.shouldSuppressSosVisual(sosId: id)) {
-          continue;
-        }
-
-        // Ignore stale SOS alerts to avoid confusion when opening app much later.
-        if (!isRecent) continue;
-
-        if ((alert['sentBy'] ?? '').toString() == currentUid) continue;
-
-        _triggerSosBlink();
-
-        if (mounted) {
-          final senderName =
-              (alert['sentByName'] ?? 'Team member').toString();
-          final caseName = (alert['caseName'] ?? 'Unknown case').toString();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('SOS received from $senderName ($caseName)'),
-              backgroundColor: AppColors.error,
-            ),
-          );
-        }
-
-        NotificationService.showSOSAlert(
+        _handleSos(
+          sosId: id,
+          sentBy: (alert['sentBy'] ?? '').toString(),
           senderName: (alert['sentByName'] ?? 'Team member').toString(),
           caseName: (alert['caseName'] ?? 'Unknown case').toString(),
-          courtRoom: (alert['courtRoom'] ?? 'Unknown courtroom').toString(),
+          courtRoom: (alert['courtRoom'] ?? '').toString(),
+          isRecent: isRecent,
         );
       }
     });
@@ -113,19 +158,87 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _blinkTicker?.cancel();
     _blinkStopper?.cancel();
+    _sosBlinkSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      final user = ref.read(currentUserProvider);
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final memoryBlinks = NotificationService.consumePendingSosBlinks();
+        for (final blink in memoryBlinks) {
+          _handleSos(
+            sosId: (blink['sosId'] ?? '').toString(),
+            sentBy: (blink['sentBy'] ?? '').toString(),
+            senderName: (blink['sentByName'] ?? 'Team member').toString(),
+            caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+            courtRoom: (blink['courtRoom'] ?? '').toString(),
+          );
+        }
+
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
+      }
+    }
   }
 
   @override
   void initState() {
     super.initState();
-    // Trigger background sync on dashboard load
+    WidgetsBinding.instance.addObserver(this);
+
+    // Path 1: FCM broadcast stream (instant foreground response)
+    _sosBlinkSub = NotificationService.sosBlinkStream.listen((data) {
+      _handleSos(
+        sosId: (data['sosId'] ?? '').toString(),
+        sentBy: (data['sentBy'] ?? '').toString(),
+        senderName: (data['sentByName'] ?? 'Team member').toString(),
+        caseName: (data['caseName'] ?? 'Unknown case').toString(),
+        courtRoom: (data['courtRoom'] ?? '').toString(),
+      );
+    });
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       final user = ref.read(currentUserProvider);
       if (user != null) {
         SyncService().fullSync();
+      }
+
+      // Path 2: In-memory pending blinks (FCM arrived before dashboard)
+      final memoryBlinks = NotificationService.consumePendingSosBlinks();
+      for (final blink in memoryBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      // Path 3: Hive pending blinks (app opened from notification)
+      final hiveBlinks = NotificationService.loadPendingSosBlinksFromHive();
+      for (final blink in hiveBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      // Path 4: Initial Firestore data (cold start, app opened normally)
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
       }
     });
   }
@@ -133,7 +246,7 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
   @override
   Widget build(BuildContext context) {
     final user = ref.watch(currentUserProvider);
-    final sosAlerts = ref.watch(sosAlertsProvider);
+    ref.watch(sosAlertsProvider); // keep subscription alive
     final cases = ref.watch(casesProvider);
     final tasks = ref.watch(tasksProvider);
     final reminders = ref.watch(remindersProvider);
@@ -141,9 +254,15 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
     final isOnline = ref.watch(connectivityProvider).value ?? true;
     final uid = user?.uid ?? '';
 
-    if (uid.isNotEmpty) {
-      _processSosAlerts(sosAlerts, uid);
-    }
+    // Path 5: Firestore stream changes (ongoing, deferred after build)
+    ref.listen<AsyncValue<List<Map<String, dynamic>>>>(
+      sosAlertsProvider,
+      (previous, next) {
+        if (uid.isNotEmpty) {
+          _processSosAlerts(next, uid);
+        }
+      },
+    );
 
     final activeCases = cases.where((c) => !c.isClosed).toList();
     final now = DateTime.now();
@@ -158,14 +277,20 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
       final uid = user?.uid ?? '';
       if (uid.isEmpty) return false;
       final assigned = List<String>.from(t['assignedJuniorIds'] ?? const []);
+      final assignedMany = List<String>.from(t['assignedToIds'] ?? const []);
+      final assignedSingle = (t['assignedToId'] ?? '').toString();
+      final participants = List<String>.from(t['participantIds'] ?? const []);
       final isOwner = t['createdBy'] == uid;
       final isPublic = t['isPublic'] == true || t['visibility'] == 'everyone';
-      final isAssigned = assigned.contains(uid);
-      return isOwner || isPublic || isAssigned;
+      final isAssigned = assigned.contains(uid) ||
+          assignedMany.contains(uid) ||
+          assignedSingle == uid;
+      return isOwner || isPublic || isAssigned || participants.contains(uid);
     }).toList();
 
-    final pendingTasks =
-        visibleTasks.where((t) => t['status'] != 'completed').toList();
+    final pendingTasks = visibleTasks
+      .where((t) => _normalizeWorkStatus(t['status']) != 'completed')
+      .toList();
 
     final visibleAssignments = assignments.where((a) {
       final uid = user?.uid ?? '';
@@ -178,8 +303,9 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
           participantIds.contains(uid) ||
           assignedToId == uid;
     }).toList();
-    final pendingAssignments =
-        visibleAssignments.where((a) => a['status'] != 'completed').toList();
+    final pendingAssignments = visibleAssignments
+      .where((a) => _normalizeWorkStatus(a['status']) != 'completed')
+      .toList();
 
     final todayReminders = reminders.where((r) {
       final d = r.dueDateTime;
@@ -616,7 +742,7 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> {
         'route': '/ecourts-import'
       },
       {
-        'icon': Icons.notifications,
+        'icon': Icons.campaign,
         'label': 'Notices',
         'color': AppColors.secondary,
         'route': '/notices'
@@ -850,6 +976,7 @@ class _ManageCaseMembersSheet extends ConsumerStatefulWidget {
 class _ManageCaseMembersSheetState
     extends ConsumerState<_ManageCaseMembersSheet> {
   late List<String> _selectedMemberIds;
+  String _selectedRole = 'lawyers';
 
   @override
   void initState() {
@@ -901,72 +1028,126 @@ class _ManageCaseMembersSheetState
             child: membersAsync.when(
               data: (members) {
                 final validMembers = members
-                    .where((m) => m.role != 'client' && m.uid != user?.uid)
+                    .where((m) => m.uid != user?.uid)
                     .toList();
 
                 if (validMembers.isEmpty) {
                   return const Center(child: Text('No firm members found.'));
                 }
 
-                return ListView.builder(
-                  padding: const EdgeInsets.all(20),
-                  itemCount: validMembers.length,
-                  itemBuilder: (context, index) {
-                    final m = validMembers[index];
-                    final isSelected = _selectedMemberIds.contains(m.uid);
+                String roleKey = _selectedRole == 'clients'
+                    ? 'client'
+                    : (_selectedRole == 'interns' ? 'intern' : 'lawyer');
+                final filteredMembers = validMembers
+                    .where((m) => m.role.toLowerCase() == roleKey)
+                    .toList();
 
-                    return GestureDetector(
-                      onTap: () {
-                        setState(() {
-                          if (isSelected) {
-                            _selectedMemberIds.remove(m.uid);
-                          } else {
-                            _selectedMemberIds.add(m.uid);
-                          }
-                        });
-                      },
-                      child: Container(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: isSelected
-                              ? AppColors.accent.withOpacity(0.1)
-                              : AppColors.white,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: isSelected
-                                  ? AppColors.accent
-                                  : Colors.grey[300]!,
-                              width: 2),
-                        ),
-                        child: Row(
-                          children: [
-                            AvatarCircle(initials: m.initials, size: 40),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(m.name,
-                                      style: TextStyle(
-                                          fontWeight: isSelected
-                                              ? FontWeight.w600
-                                              : FontWeight.w500)),
-                                  Text(m.role,
-                                      style: TextStyle(
-                                          fontSize: 12,
-                                          color: Colors.grey[600])),
-                                ],
-                              ),
-                            ),
-                            if (isSelected)
-                              const Icon(Icons.check_circle,
-                                  color: AppColors.accent),
-                          ],
-                        ),
+                return ListView(
+                  padding: const EdgeInsets.all(20),
+                  children: [
+                    const Text(
+                      'Assign to',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.text,
                       ),
-                    );
-                  },
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildTeamCategoryOption(
+                            value: 'clients',
+                            icon: Icons.person,
+                            label: 'Clients',
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _buildTeamCategoryOption(
+                            value: 'lawyers',
+                            icon: Icons.gavel,
+                            label: 'Lawyers',
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: _buildTeamCategoryOption(
+                            value: 'interns',
+                            icon: Icons.school,
+                            label: 'Interns',
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    if (filteredMembers.isEmpty)
+                      Text(
+                        'No members available in this category.',
+                        style: TextStyle(color: Colors.grey[600]),
+                      ),
+                    ...filteredMembers.map((m) {
+                      final isSelected = _selectedMemberIds.contains(m.uid);
+                      return GestureDetector(
+                        onTap: () {
+                          setState(() {
+                            if (isSelected) {
+                              _selectedMemberIds.remove(m.uid);
+                            } else {
+                              _selectedMemberIds.add(m.uid);
+                            }
+                          });
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? AppColors.accent.withOpacity(0.1)
+                                : AppColors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                              color:
+                                  isSelected ? AppColors.accent : Colors.grey[300]!,
+                              width: 2,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              AvatarCircle(initials: m.initials, size: 40),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      m.name,
+                                      style: TextStyle(
+                                        fontWeight: isSelected
+                                            ? FontWeight.w600
+                                            : FontWeight.w500,
+                                      ),
+                                    ),
+                                    Text(
+                                      m.role,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: Colors.grey[600],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              if (isSelected)
+                                const Icon(Icons.check_circle,
+                                    color: AppColors.accent),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
                 );
               },
               loading: () => const Center(child: CircularProgressIndicator()),
@@ -987,23 +1168,50 @@ class _ManageCaseMembersSheetState
                       borderRadius: BorderRadius.circular(12)),
                 ),
                 onPressed: () {
-                  // Ensure current user is always in the list if they are a lawyer/intern
-                  if (user != null &&
-                      user.role != 'client' &&
-                      !_selectedMemberIds.contains(user.uid)) {
-                    _selectedMemberIds.add(user.uid);
-                  }
+                  final selected = List<String>.from(_selectedMemberIds);
+                  final allMembers = ref.read(firmMembersProvider).valueOrNull ?? const [];
+                  final selectedLawyerIds = allMembers
+                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'lawyer')
+                      .map((m) => m.uid)
+                      .toList();
+                  final selectedInternIds = allMembers
+                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'intern')
+                      .map((m) => m.uid)
+                      .toList();
+                  final selectedClientIds = allMembers
+                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'client')
+                      .map((m) => m.uid)
+                      .toList();
 
                   ref
                       .read(casesProvider.notifier)
                       .updateCase(widget.caseModel.cino, {
-                    // Updating both for backward compatibility
-                    'assignedLawyerIds': _selectedMemberIds,
-                    'assignedInternIds': [],
+                    'assignedLawyerIds': selectedLawyerIds,
+                    'assignedInternIds': selectedInternIds,
+                    'clientIds': selectedClientIds,
+                    'assignedMemberIds': selected,
+                  }, queueSync: false);
+
+                  ref
+                      .read(firestoreServiceProvider)
+                      .updateCaseTeamMembers(
+                        cino: widget.caseModel.cino,
+                        memberIds: selected,
+                        lawyerIds: selectedLawyerIds,
+                        internIds: selectedInternIds,
+                        clientIds: selectedClientIds,
+                      )
+                      .then((_) {
+                    if (!mounted) return;
+                    Navigator.pop(context);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Team updated!')));
+                  }).catchError((e) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Failed to save team: $e')),
+                    );
                   });
-                  Navigator.pop(context);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Team updated!')));
                 },
                 child: const Text('Save Team',
                     style:
@@ -1012,6 +1220,41 @@ class _ManageCaseMembersSheetState
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildTeamCategoryOption({
+    required String value,
+    required IconData icon,
+    required String label,
+  }) {
+    final isSelected = _selectedRole == value;
+    return GestureDetector(
+      onTap: () => setState(() => _selectedRole = value),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: isSelected ? AppColors.accent.withOpacity(0.15) : AppColors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isSelected ? AppColors.accent : Colors.grey[300]!,
+            width: 2,
+          ),
+        ),
+        child: Column(
+          children: [
+            Icon(icon, color: isSelected ? AppColors.accent : Colors.grey[400]),
+            const SizedBox(height: 8),
+            Text(
+              label,
+              style: TextStyle(
+                fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                color: AppColors.text,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1654,9 +1897,20 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
   Widget build(BuildContext context) {
     // If no argument passed, use first case from provider
     final cases = ref.watch(casesProvider);
-    final c = _caseModel ?? (cases.isNotEmpty ? cases.first : null);
+    CaseModel? resolvedCase;
+    if (_caseModel != null) {
+      for (final item in cases) {
+        if (item.cino == _caseModel!.cino) {
+          resolvedCase = item;
+          break;
+        }
+      }
+      resolvedCase ??= _caseModel;
+    } else {
+      resolvedCase = cases.isNotEmpty ? cases.first : null;
+    }
 
-    if (c == null) {
+    if (resolvedCase == null) {
       return Scaffold(
         body: Center(
           child: Column(
@@ -1673,8 +1927,11 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
       );
     }
 
+    final c = resolvedCase;
+
     final tasks = ref.watch(tasksProvider);
     final caseTasks = tasks.where((t) => t['caseId'] == c.cino).toList();
+    final canEditCase = _canEditCaseDetails(c);
 
     return Scaffold(
       body: Column(
@@ -1700,16 +1957,49 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                         ),
                       ],
                     ),
-                    if (!c.isClosed)
-                      IconButton(
-                        onPressed: () => Navigator.pushNamed(
-                            context, '/courtroom-sos',
-                            arguments: c),
-                        icon: const Icon(Icons.sos, color: AppColors.error),
-                        style: IconButton.styleFrom(
-                          backgroundColor: AppColors.error.withOpacity(0.15),
-                        ),
-                      ),
+                    Row(
+                      children: [
+                        if (canEditCase)
+                          PopupMenuButton<String>(
+                            tooltip: 'Case actions',
+                            icon:
+                                const Icon(Icons.edit_note, color: AppColors.white),
+                            onSelected: (value) {
+                              if (value == 'edit') {
+                                _showEditCaseDetailsDialog(c);
+                                return;
+                              }
+                              if (value == 'close' && !c.isClosed) {
+                                _confirmCloseCase(c);
+                              }
+                            },
+                            itemBuilder: (context) => [
+                              const PopupMenuItem<String>(
+                                value: 'edit',
+                                child: Text('Edit Case Details'),
+                              ),
+                              if (!c.isClosed)
+                                const PopupMenuItem<String>(
+                                  value: 'close',
+                                  child: Text('Close Case'),
+                                ),
+                            ],
+                          ),
+                        if (!c.isClosed)
+                          IconButton(
+                            onPressed: () => Navigator.pushNamed(
+                              context,
+                              '/courtroom-sos',
+                              arguments: c,
+                            ),
+                            icon: const Icon(Icons.sos, color: AppColors.error),
+                            style: IconButton.styleFrom(
+                              backgroundColor:
+                                  AppColors.error.withOpacity(0.15),
+                            ),
+                          ),
+                      ],
+                    ),
                   ],
                 ),
                 const SizedBox(height: 16),
@@ -1850,123 +2140,233 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
             ),
           ),
           const SizedBox(height: 16),
-          if (c.assignedMemberIds.isNotEmpty) ...[
-            AppCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text('Assigned Team',
-                          style:
-                              TextStyle(fontSize: 13, color: Colors.grey[600])),
-                      if (!c.isClosed)
-                        TextButton.icon(
-                          onPressed: () => _showManageMembersDialog(context, c),
-                          icon: const Icon(Icons.group_add, size: 16),
-                          label: const Text('Manage Team',
-                              style: TextStyle(fontSize: 12)),
-                          style: TextButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 8, vertical: 0),
-                            minimumSize: Size.zero,
-                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                          ),
+          AppCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('Assigned Team',
+                        style:
+                            TextStyle(fontSize: 13, color: Colors.grey[600])),
+                    if (!c.isClosed)
+                      TextButton.icon(
+                        onPressed: () => _showManageMembersDialog(context, c),
+                        icon: const Icon(Icons.group_add, size: 16),
+                        label: const Text('Manage Team',
+                            style: TextStyle(fontSize: 12)),
+                        style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 0),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                         ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  ref.watch(firmMembersProvider).when(
-                        data: (members) {
-                          final assigned = members
-                              .where((m) => c.assignedMemberIds.contains(m.uid))
-                              .toList();
-                          if (assigned.isEmpty) return const SizedBox.shrink();
-                          return Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: assigned.map((m) {
-                              return Tooltip(
-                                message: m.name,
-                                child: CircleAvatar(
-                                  radius: 16,
-                                  backgroundColor: AppColors.primary,
-                                  child: Text(m.initials,
-                                      style: const TextStyle(
-                                          fontSize: 11,
-                                          color: AppColors.white,
-                                          fontWeight: FontWeight.bold)),
-                                ),
-                              );
-                            }).toList(),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                ref.watch(firmMembersProvider).when(
+                      data: (members) {
+                        final assigned = members
+                            .where((m) => c.assignedMemberIds.contains(m.uid))
+                            .toList();
+                        if (assigned.isEmpty) {
+                          return Text(
+                            'No members assigned',
+                            style: TextStyle(fontSize: 13, color: Colors.grey[600]),
                           );
-                        },
-                        loading: () => const SizedBox(
-                            height: 32,
-                            width: 32,
-                            child: CircularProgressIndicator()),
-                        error: (_, __) => const SizedBox.shrink(),
-                      ),
-                ],
-              ),
+                        }
+                        return Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: assigned.map((m) {
+                            return Tooltip(
+                              message: m.name,
+                              child: CircleAvatar(
+                                radius: 16,
+                                backgroundColor: AppColors.primary,
+                                child: Text(m.initials,
+                                    style: const TextStyle(
+                                        fontSize: 11,
+                                        color: AppColors.white,
+                                        fontWeight: FontWeight.bold)),
+                              ),
+                            );
+                          }).toList(),
+                        );
+                      },
+                      loading: () => const SizedBox(
+                          height: 32,
+                          width: 32,
+                          child: CircularProgressIndicator()),
+                      error: (_, __) => const SizedBox.shrink(),
+                    ),
+              ],
             ),
-            const SizedBox(height: 16),
-            if (!c.isClosed)
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.secondary.withOpacity(0.1),
-                    foregroundColor: AppColors.secondary,
-                    elevation: 0,
-                  ),
-                  onPressed: () => _createCaseChat(context, c),
-                  icon: const Icon(Icons.chat_bubble_outline, size: 18),
-                  label: const Text('Open Case Chat'),
-                ),
-              ),
-            const SizedBox(height: 12),
-            if (c.assignedMemberIds.isNotEmpty && !c.isClosed)
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.accent.withOpacity(0.1),
-                    foregroundColor: AppColors.primary,
-                    elevation: 0,
-                  ),
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => CreateReminderScreen(
-                          initialMemberIds: c.assignedMemberIds.toSet()
-                            ..add(ref.read(currentUserProvider)?.uid ?? ''),
-                        ),
-                      ),
-                    );
-                  },
-                  icon: const Icon(Icons.event_available, size: 18),
-                  label: const Text('New Case Reminder'),
-                ),
-              ),
-            const SizedBox(height: 16),
-          ],
-          // Generate Document button
-          if (!c.isClosed)
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: () => Navigator.pushNamed(
-                    context, '/document-generator',
-                    arguments: c),
-                icon: const Icon(Icons.description, size: 18),
-                label: const Text('Generate Document'),
-              ),
-            ),
+          ),
+          const SizedBox(height: 16),
         ],
       ),
+    );
+  }
+
+  bool _canEditCaseDetails(CaseModel c) {
+    final user = ref.read(currentUserProvider);
+    if (user == null || user.role != 'lawyer') return false;
+
+    final raw = HiveService.get(HiveService.casesBox, c.cino);
+    if (raw is! Map<String, dynamic>) return false;
+
+    final ownerUid = (raw['ownerUid'] ?? '').toString().trim();
+    if (ownerUid.isNotEmpty) {
+      return ownerUid == user.uid;
+    }
+
+    final createdBy = (raw['createdBy'] ?? '').toString().trim();
+    return createdBy.isNotEmpty && createdBy == user.uid;
+  }
+
+  Future<void> _showEditCaseDetailsDialog(CaseModel c) async {
+    if (!_canEditCaseDetails(c)) return;
+
+    final titleCtrl = TextEditingController(text: c.title);
+    final petitionerCtrl = TextEditingController(text: c.petitioner);
+    final respondentCtrl = TextEditingController(text: c.respondent);
+    final caseTypeCtrl = TextEditingController(text: c.caseType);
+    final courtComplexCtrl = TextEditingController(text: c.courtComplex);
+    final courtRoomCtrl = TextEditingController(text: c.courtRoom);
+    final districtCtrl = TextEditingController(text: c.district);
+    final stateCtrl = TextEditingController(text: c.state);
+    final stageCtrl = TextEditingController(text: c.currentStage);
+    DateTime? hearingDate = c.nextHearingDate;
+
+    final save = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('Edit Case Details'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: 'Title')),
+                const SizedBox(height: 8),
+                TextField(controller: petitionerCtrl, decoration: const InputDecoration(labelText: 'Petitioner')),
+                const SizedBox(height: 8),
+                TextField(controller: respondentCtrl, decoration: const InputDecoration(labelText: 'Respondent')),
+                const SizedBox(height: 8),
+                TextField(controller: caseTypeCtrl, decoration: const InputDecoration(labelText: 'Case Type')),
+                const SizedBox(height: 8),
+                TextField(controller: stageCtrl, decoration: const InputDecoration(labelText: 'Current Stage')),
+                const SizedBox(height: 8),
+                TextField(controller: courtComplexCtrl, decoration: const InputDecoration(labelText: 'Court Complex')),
+                const SizedBox(height: 8),
+                TextField(controller: courtRoomCtrl, decoration: const InputDecoration(labelText: 'Court Room')),
+                const SizedBox(height: 8),
+                TextField(controller: districtCtrl, decoration: const InputDecoration(labelText: 'District')),
+                const SizedBox(height: 8),
+                TextField(controller: stateCtrl, decoration: const InputDecoration(labelText: 'State')),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        hearingDate == null
+                            ? 'No hearing date'
+                            : 'Hearing: ${DateFormat('dd MMM yyyy').format(hearingDate!)}',
+                        style: TextStyle(color: Colors.grey[700]),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () async {
+                        final picked = await showDatePicker(
+                          context: ctx,
+                          initialDate: hearingDate ?? DateTime.now(),
+                          firstDate: DateTime.now().subtract(const Duration(days: 3650)),
+                          lastDate: DateTime.now().add(const Duration(days: 3650)),
+                        );
+                        if (picked != null) {
+                          setDialogState(() => hearingDate = picked);
+                        }
+                      },
+                      child: const Text('Set Date'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+            ElevatedButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Save')),
+          ],
+        ),
+      ),
+    );
+
+    if (save != true) return;
+    if (titleCtrl.text.trim().isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Case title cannot be empty')),
+      );
+      return;
+    }
+
+    await ref.read(casesProvider.notifier).updateCase(c.cino, {
+      'title': titleCtrl.text.trim(),
+      'petitioner': petitionerCtrl.text.trim(),
+      'respondent': respondentCtrl.text.trim(),
+      'caseType': caseTypeCtrl.text.trim(),
+      'currentStage': stageCtrl.text.trim(),
+      'courtComplex': courtComplexCtrl.text.trim(),
+      'courtRoom': courtRoomCtrl.text.trim(),
+      'district': districtCtrl.text.trim(),
+      'state': stateCtrl.text.trim(),
+      'nextHearingDate': hearingDate?.toIso8601String(),
+      'updatedAt': DateTime.now().toIso8601String(),
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Case details updated successfully')),
+    );
+  }
+
+  Future<void> _confirmCloseCase(CaseModel c) async {
+    if (!_canEditCaseDetails(c) || c.isClosed) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Close Case'),
+        content: const Text('Mark this case as closed? You can still view case history after closing.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Close Case', style: TextStyle(color: AppColors.error)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final now = DateTime.now();
+    final actorName = ref.read(currentUserProvider)?.name ?? 'Owner';
+
+    await ref.read(casesProvider.notifier).updateCase(c.cino, {
+      'decisionDate': now.toIso8601String(),
+      'disposalStatus': 'Closed by $actorName',
+      'isClosed': true,
+      'updatedAt': now.toIso8601String(),
+    });
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Case closed successfully')),
     );
   }
 
@@ -1993,7 +2393,8 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
       itemCount: caseTasks.length,
       itemBuilder: (context, index) {
         final task = caseTasks[index];
-        final isCompleted = task['status'] == 'completed';
+        final status = _normalizeWorkStatus(task['status']);
+        final isCompleted = status == 'completed';
         final isEscalated = task['isEscalated'] == true;
 
         return Container(
@@ -2005,7 +2406,7 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                 GestureDetector(
                   onTap: () {
                     ref.read(tasksProvider.notifier).updateTask(task['id'], {
-                      'status': isCompleted ? 'pending' : 'completed',
+                      'status': isCompleted ? 'inProgress' : 'completed',
                     });
                   },
                   child: Container(
@@ -2067,63 +2468,128 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                   ),
                 ),
                 PopupMenuButton<String>(
-                  onSelected: (value) {
+                  onSelected: (value) async {
+                    final isCreator = (task['createdBy'] ?? '').toString() ==
+                        (currentUser?.uid ?? '');
+                    final uid = (currentUser?.uid ?? '').toString();
+                    final assignedJuniorIds =
+                        List<String>.from(task['assignedJuniorIds'] ?? const []);
+                    final assignedToIds =
+                        List<String>.from(task['assignedToIds'] ?? const []);
+                    final assignedToId = (task['assignedToId'] ?? '').toString();
+                    final isAssignedToMe = assignedJuniorIds.contains(uid) ||
+                        assignedToIds.contains(uid) ||
+                        assignedToId == uid;
                     if (value == 'edit') {
+                      if (!isCreator) return;
                       _showEditCaseTaskDialog(task);
                       return;
                     }
-                    if (value == 'status_pending') {
-                      ref.read(tasksProvider.notifier).updateTask(task['id'], {
-                        'status': 'pending',
-                      });
-                      return;
-                    }
                     if (value == 'status_inProgress') {
-                      ref.read(tasksProvider.notifier).updateTask(task['id'], {
+                      if (!(isAssignedToMe || isCreator)) return;
+                      await ref.read(tasksProvider.notifier).updateTask(task['id'], {
                         'status': 'inProgress',
                       });
                       return;
                     }
                     if (value == 'status_completed') {
-                      ref.read(tasksProvider.notifier).updateTask(task['id'], {
+                      if (!(isAssignedToMe || isCreator)) return;
+                      await ref.read(tasksProvider.notifier).updateTask(task['id'], {
                         'status': 'completed',
                       });
                       return;
                     }
+                    if (value == 'status_back_inProgress') {
+                      if (!(isAssignedToMe || isCreator)) return;
+                      await ref.read(tasksProvider.notifier).updateTask(task['id'], {
+                        'status': 'inProgress',
+                      });
+                      return;
+                    }
                     if (value == 'delete') {
-                      if (isInternUser) return;
-                      ref.read(tasksProvider.notifier).deleteTask(task['id']);
+                      if (isInternUser || !isCreator) return;
+                      await ref.read(tasksProvider.notifier).deleteTask(task['id']);
                     }
                   },
-                  itemBuilder: (ctx) => [
-                    const PopupMenuItem<String>(
-                      value: 'edit',
-                      child: Text('Edit Task'),
-                    ),
-                    const PopupMenuItem<String>(
-                      value: 'status_pending',
-                      child: Text('Mark Pending'),
-                    ),
-                    const PopupMenuItem<String>(
-                      value: 'status_inProgress',
-                      child: Text('Mark In Progress'),
-                    ),
-                    const PopupMenuItem<String>(
-                      value: 'status_completed',
-                      child: Text('Mark Completed'),
-                    ),
-                    if (!isInternUser)
-                      const PopupMenuItem<String>(
+                  itemBuilder: (ctx) {
+                    final isCreator = (task['createdBy'] ?? '').toString() ==
+                        (currentUser?.uid ?? '');
+                    final uid = (currentUser?.uid ?? '').toString();
+                    final assignedJuniorIds =
+                        List<String>.from(task['assignedJuniorIds'] ?? const []);
+                    final assignedToIds =
+                        List<String>.from(task['assignedToIds'] ?? const []);
+                    final assignedToId = (task['assignedToId'] ?? '').toString();
+                    final isAssignedToMe = assignedJuniorIds.contains(uid) ||
+                        assignedToIds.contains(uid) ||
+                        assignedToId == uid;
+                    final status = _normalizeWorkStatus(task['status']);
+                    final items = <PopupMenuEntry<String>>[];
+                    if (isCreator && status == 'inProgress') {
+                      items.add(const PopupMenuItem<String>(
+                        value: 'edit',
+                        child: Text('Edit Task'),
+                      ));
+                    }
+
+                    if (status == 'inProgress') {
+                      if (isAssignedToMe || isCreator) {
+                        items.add(const PopupMenuItem<String>(
+                          value: 'status_completed',
+                          child: Text('Mark Completed'),
+                        ));
+                      }
+                    } else if (status == 'completed') {
+                      if (isAssignedToMe || isCreator) {
+                        items.add(const PopupMenuItem<String>(
+                          value: 'status_back_inProgress',
+                          child: Text('Mark In Progress'),
+                        ));
+                      }
+                    }
+
+                    if (!isInternUser && isCreator) {
+                      items.add(const PopupMenuItem<String>(
                         value: 'delete',
                         child: Text('Delete Task'),
-                      ),
-                  ],
+                      ));
+                    }
+
+                    return items;
+                  },
                 ),
               ],
             ),
           ),
         );
       },
+    );
+  }
+
+  Future<DateTime?> _pickCaseTaskDateTime({
+    required BuildContext context,
+    required DateTime initial,
+  }) async {
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime.now().subtract(const Duration(days: 365)),
+      lastDate: DateTime.now().add(const Duration(days: 3650)),
+    );
+    if (pickedDate == null) return null;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (pickedTime == null) return null;
+
+    return DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
     );
   }
 
@@ -2158,11 +2624,9 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                   const SizedBox(height: 8),
                   TextButton.icon(
                     onPressed: () async {
-                      final picked = await showDatePicker(
+                      final picked = await _pickCaseTaskDateTime(
                         context: ctx,
-                        initialDate: selectedDeadline,
-                        firstDate: DateTime.now().subtract(const Duration(days: 365)),
-                        lastDate: DateTime.now().add(const Duration(days: 3650)),
+                        initial: selectedDeadline,
                       );
                       if (picked != null) {
                         setDialogState(() => selectedDeadline = picked);
@@ -2170,7 +2634,7 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                     },
                     icon: const Icon(Icons.calendar_today),
                     label: Text(
-                        'Deadline: ${DateFormat('dd/MM/yyyy').format(selectedDeadline)}'),
+                        'Deadline: ${DateFormat('dd/MM/yyyy, h:mm a').format(selectedDeadline)}'),
                   ),
                 ],
               ),
@@ -2601,8 +3065,17 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
     final membersAsync = ref.read(firmMembersProvider);
     final allMembers = membersAsync.valueOrNull ?? [];
 
-    final memberIds = <String>{...c.assignedMemberIds, user?.uid ?? ''}
+    final memberIds = <String>{
+      ...c.assignedMemberIds,
+    }
       ..removeWhere((e) => e.trim().isEmpty);
+
+    if (memberIds.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No members are assigned to this case yet.')),
+      );
+      return;
+    }
 
     final memberNames = <String>[];
     for (final id in memberIds) {
@@ -2630,6 +3103,29 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
     }).firstOrNull;
 
     if (existingChat != null) {
+      final existingSet = existingChat.memberIds.toSet();
+      if (!existingSet.containsAll(memberIds) || !memberIds.containsAll(existingSet)) {
+        final updated = ChatGroup(
+          id: existingChat.id,
+          caseId: existingChat.caseId,
+          name: existingChat.name,
+          description: existingChat.description,
+          memberIds: memberIds.toList(),
+          memberNames: memberNames,
+          createdAt: existingChat.createdAt,
+          createdBy: existingChat.createdBy,
+          createdByName: existingChat.createdByName,
+          lastMessage: existingChat.lastMessage,
+          lastMessageTime: existingChat.lastMessageTime,
+          isTemporary: existingChat.isTemporary,
+          isGroup: existingChat.isGroup,
+          hiddenForUserIds: existingChat.hiddenForUserIds,
+          clearedAtByUser: existingChat.clearedAtByUser,
+        );
+        // Best effort: creator permissions are enforced in backend callable.
+        ref.read(chatGroupsProvider.notifier).updateChatGroup(updated);
+      }
+
       Navigator.push(
         context,
         MaterialPageRoute(
@@ -2724,112 +3220,8 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
     }
   }
 
-  void _showManageTeamSheet(CaseModel c) {
-    List<String> selectedIds = List.from(c.assignedMemberIds);
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: AppColors.background,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (_) {
-        return StatefulBuilder(
-          builder: (context, setStateSheet) {
-            final membersAsync = ref.watch(firmMembersProvider);
-            return Container(
-              padding: EdgeInsets.only(
-                bottom: MediaQuery.of(context).viewInsets.bottom,
-              ),
-              child: SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text(
-                        'Manage Case Team',
-                        style: TextStyle(
-                            fontSize: 18,
-                            fontWeight: FontWeight.w600,
-                            color: AppColors.text),
-                      ),
-                      const SizedBox(height: 16),
-                      membersAsync.when(
-                        data: (members) {
-                          if (members.isEmpty) {
-                            return const Center(
-                                child: Text('No firm members found'));
-                          }
-                          final existing = members
-                              .where((m) => selectedIds.contains(m.uid))
-                              .toList();
-                          return Flexible(
-                            child: SingleChildScrollView(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    existing.isEmpty
-                                        ? 'Current team: none'
-                                        : 'Current team: ${existing.map((m) => m.name).join(', ')}',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.grey[700],
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  MemberSelector(
-                                    members: members,
-                                    selectedIds: selectedIds,
-                                    currentUserId:
-                                        ref.read(currentUserProvider)?.uid,
-                                    onChanged: (ids) {
-                                      setStateSheet(() => selectedIds = ids);
-                                    },
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                        loading: () => const CircularProgressIndicator(),
-                        error: (err, _) => Text('Error loading members: $err'),
-                      ),
-                      const SizedBox(height: 24),
-                      SizedBox(
-                        width: double.infinity,
-                        child: ElevatedButton(
-                          onPressed: () {
-                            ref
-                                .read(casesProvider.notifier)
-                                .updateCase(c.cino, {
-                              'assignedLawyerIds':
-                                  selectedIds, // Keep old map key for backward compatibility
-                              'assignedInternIds': [],
-                            });
-                            Navigator.pop(context);
-                            ScaffoldMessenger.of(this.context).showSnackBar(
-                              const SnackBar(
-                                  content: Text('Team updated successfully')),
-                            );
-                          },
-                          child: const Text('Save Team'),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-
   void _showAddOptions(CaseModel c) {
+    final canEditCase = _canEditCaseDetails(c);
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -2844,10 +3236,6 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
               const Text('Add to Case',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
               const SizedBox(height: 20),
-              _addOption(Icons.group_add, 'Manage Team', () {
-                Navigator.pop(context);
-                _showManageTeamSheet(c);
-              }),
               _addOption(Icons.task_alt, 'Add Task', () {
                 Navigator.pop(context);
                 Navigator.pushNamed(
@@ -2872,6 +3260,11 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                 Navigator.pop(context);
                 Navigator.pushNamed(context, '/courtroom-sos', arguments: c);
               }),
+              if (canEditCase && !c.isClosed)
+                _addOption(Icons.gavel, 'Close Case', () {
+                  Navigator.pop(context);
+                  _confirmCloseCase(c);
+                }),
               const SizedBox(height: 16),
             ],
           ),
@@ -3125,7 +3518,7 @@ class CourtCalendarScreen extends ConsumerWidget {
               ],
             ),
           ),
-          const Icon(Icons.notifications, color: AppColors.accent, size: 20),
+          const Icon(Icons.campaign, color: AppColors.accent, size: 20),
         ],
       ),
     );
@@ -3550,13 +3943,11 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
           const SizedBox(height: 8),
           GestureDetector(
             onTap: () async {
-              final date = await showDatePicker(
+              final picked = await _pickDateTime(
                 context: context,
-                initialDate: _deadline,
-                firstDate: DateTime.now(),
-                lastDate: DateTime.now().add(const Duration(days: 365)),
+                initial: _deadline,
               );
-              if (date != null) setState(() => _deadline = date);
+              if (picked != null) setState(() => _deadline = picked);
             },
             child: Container(
               padding: const EdgeInsets.all(16),
@@ -3569,7 +3960,7 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 children: [
                   const Icon(Icons.calendar_today, color: AppColors.accent),
                   const SizedBox(width: 12),
-                  Text(DateFormat('dd/MM/yyyy').format(_deadline),
+                  Text(DateFormat('dd/MM/yyyy, h:mm a').format(_deadline),
                       style: const TextStyle(color: AppColors.text)),
                 ],
               ),
@@ -3628,9 +4019,10 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
     final isInternUser = user.role == 'intern';
 
     if (isInternUser) {
-      _visibility = 'private';
-      _selectedMemberIds = [user.uid];
-      _autoEscalate = false;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only lawyers can create tasks.')),
+      );
+      return;
     }
 
     if (!isInternUser &&
@@ -3666,7 +4058,15 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       participants.addAll(_selectedMemberIds);
     }
 
+    final members = ref.read(firmMembersProvider).valueOrNull ?? [];
     final taskId = _uuid.v4();
+    final selectedMembers = members
+      .where((m) => _selectedMemberIds.contains(m.uid))
+      .map((m) => m.name)
+      .toList();
+    final assignedToName = selectedMembers.isEmpty
+      ? 'Unassigned'
+      : selectedMembers.join(', ');
     final task = {
       'id': taskId,
       'title': _titleController.text.trim(),
@@ -3678,11 +4078,17 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       'deadline': _deadline.toIso8601String(),
       'visibility': isInternUser ? 'private' : _visibility,
       'assignedJuniorIds': isInternUser ? [user.uid] : _selectedMemberIds,
+        'assignedToIds': isInternUser ? [user.uid] : _selectedMemberIds,
+        'assignedToId': isInternUser
+          ? user.uid
+          : (_selectedMemberIds.isEmpty ? '' : _selectedMemberIds.first),
+        'assignedToName': isInternUser ? user.name : assignedToName,
       'participantIds': participants.toList(),
-      'status': 'pending',
+      'status': 'inProgress',
       'autoEscalate': isInternUser ? false : _autoEscalate,
       'isEscalated': false,
       'isPublic': false,
+      'assignedAt': DateTime.now().toIso8601String(),
       'createdAt': DateTime.now().toIso8601String(),
       'updatedAt': DateTime.now().toIso8601String(),
     };
@@ -3778,14 +4184,10 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
 
   String _taskStatusLabel(String status) {
     switch (status) {
-      case 'inProgress':
-        return 'IN PROGRESS';
       case 'completed':
         return 'COMPLETED';
-      case 'overdue':
-        return 'OVERDUE';
       default:
-        return 'PENDING';
+        return 'IN PROGRESS';
     }
   }
 
@@ -3800,12 +4202,25 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
   }
 
   Future<void> _showEditTaskDialog(Map<String, dynamic> task) async {
+    final currentUser = ref.read(currentUserProvider);
     final titleController = TextEditingController(text: task['title'] ?? '');
     final descriptionController =
         TextEditingController(text: task['description'] ?? '');
+    final activeCases = ref.read(casesProvider).where((c) => !c.isClosed).toList();
+    final members = ref.read(firmMembersProvider).valueOrNull ?? [];
     DateTime selectedDeadline = task['deadline'] != null
         ? DateTime.tryParse(task['deadline']) ?? DateTime.now()
         : DateTime.now();
+    String selectedVisibility = (task['visibility'] ?? 'private').toString();
+    String? selectedCaseId = (task['caseId'] ?? '').toString().trim().isEmpty
+        ? null
+        : (task['caseId'] ?? '').toString();
+    bool selectedAutoEscalate = task['autoEscalate'] == true;
+    final selectedMemberIds = <String>{
+      ...List<String>.from(task['assignedJuniorIds'] ?? const []),
+      ...List<String>.from(task['assignedToIds'] ?? const []),
+      (task['assignedToId'] ?? '').toString(),
+    }..removeWhere((id) => id.trim().isEmpty);
 
     final shouldSave = await showDialog<bool>(
       context: context,
@@ -3828,14 +4243,245 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     maxLines: 3,
                     decoration: const InputDecoration(labelText: 'Description'),
                   ),
+                  const SizedBox(height: 12),
+                  DropdownButtonFormField<String?>(
+                    value: selectedCaseId,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Linked Case'),
+                    items: [
+                      const DropdownMenuItem<String?>(
+                        value: null,
+                        child: Text('None'),
+                      ),
+                      ...activeCases.map(
+                        (c) => DropdownMenuItem<String?>(
+                          value: c.cino,
+                          child: Text(c.title, overflow: TextOverflow.ellipsis),
+                        ),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      setDialogState(() => selectedCaseId = value);
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Assign to',
+                    style: TextStyle(color: Colors.grey[700]),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() {
+                            selectedVisibility = 'private';
+                            selectedMemberIds.clear();
+                          }),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'private'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'private'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.lock, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Private',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() => selectedVisibility = 'lawyers'),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'lawyers'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'lawyers'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.gavel, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Lawyers',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() => selectedVisibility = 'interns'),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'interns'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'interns'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.school, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Interns',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (selectedVisibility == 'lawyers' || selectedVisibility == 'interns') ...[
+                    const SizedBox(height: 12),
+                    Builder(
+                      builder: (_) {
+                        final filteredMembers = members
+                            .where((m) =>
+                                m.uid != currentUser?.uid &&
+                                (m.role as String).toLowerCase() ==
+                                    (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
+                            .toList();
+                        final allSelected = filteredMembers.isNotEmpty &&
+                            filteredMembers.every((m) => selectedMemberIds.contains(m.uid));
+                        return Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton(
+                            onPressed: () {
+                              setDialogState(() {
+                                if (allSelected) {
+                                  for (final m in filteredMembers) {
+                                    selectedMemberIds.remove(m.uid);
+                                  }
+                                } else {
+                                  for (final m in filteredMembers) {
+                                    selectedMemberIds.add(m.uid);
+                                  }
+                                }
+                              });
+                            },
+                            child: Text(allSelected ? 'Deselect All' : 'Select All'),
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ...members
+                        .where((m) =>
+                            m.uid != currentUser?.uid &&
+                            (m.role as String).toLowerCase() ==
+                                (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
+                        .map((m) {
+                      final selected = selectedMemberIds.contains(m.uid);
+                      return GestureDetector(
+                        onTap: () {
+                          setDialogState(() {
+                            if (selected) {
+                              selectedMemberIds.remove(m.uid);
+                            } else {
+                              selectedMemberIds.add(m.uid);
+                            }
+                          });
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: selected
+                                ? AppColors.accent.withOpacity(0.1)
+                                : AppColors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                                color: selected
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2),
+                          ),
+                          child: Row(
+                            children: [
+                              AvatarCircle(initials: m.initials, size: 32),
+                              const SizedBox(width: 10),
+                              Expanded(child: Text(m.name)),
+                              if (selected)
+                                const Icon(Icons.check_circle,
+                                    color: AppColors.accent, size: 18),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                  const SizedBox(height: 12),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Auto-escalate when overdue'),
+                    value: selectedAutoEscalate,
+                    onChanged: (v) => setDialogState(() => selectedAutoEscalate = v),
+                  ),
                   const SizedBox(height: 16),
                   TextButton.icon(
                     onPressed: () async {
-                      final picked = await showDatePicker(
+                      final picked = await _pickDateTime(
                         context: ctx,
-                        initialDate: selectedDeadline,
-                        firstDate: DateTime.now().subtract(const Duration(days: 365)),
-                        lastDate: DateTime.now().add(const Duration(days: 3650)),
+                        initial: selectedDeadline,
                       );
                       if (picked != null) {
                         setDialogState(() => selectedDeadline = picked);
@@ -3843,7 +4489,7 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     },
                     icon: const Icon(Icons.calendar_today),
                     label: Text(
-                      'Deadline: ${DateFormat('dd/MM/yyyy').format(selectedDeadline)}',
+                      'Deadline: ${DateFormat('dd/MM/yyyy, h:mm a').format(selectedDeadline)}',
                     ),
                   ),
                 ],
@@ -3873,15 +4519,40 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       return;
     }
 
-    await ref.read(tasksProvider.notifier).updateTask(task['id'], {
-      'title': titleController.text.trim(),
-      'description': descriptionController.text.trim(),
-      'deadline': selectedDeadline.toIso8601String(),
-    });
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Task updated successfully')),
-    );
+    final participants = <String>{
+      (task['createdBy'] ?? '').toString(),
+      ...selectedMemberIds,
+    }..removeWhere((id) => id.trim().isEmpty);
+    final assigneeNames = members
+        .where((m) => selectedMemberIds.contains(m.uid))
+        .map((m) => m.name)
+        .toList();
+
+    try {
+      await ref.read(tasksProvider.notifier).updateTask(task['id'], {
+        'title': titleController.text.trim(),
+        'description': descriptionController.text.trim(),
+        'deadline': selectedDeadline.toIso8601String(),
+        'caseId': selectedCaseId,
+        'visibility': selectedVisibility,
+        'assignedJuniorIds': selectedMemberIds.toList(),
+        'assignedToIds': selectedMemberIds.toList(),
+        'assignedToId': selectedMemberIds.isEmpty ? '' : selectedMemberIds.first,
+        'assignedToName':
+            assigneeNames.isEmpty ? 'Unassigned' : assigneeNames.join(', '),
+        'participantIds': participants.toList(),
+        'autoEscalate': selectedAutoEscalate,
+      });
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Task updated successfully')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unable to save task edits: $e')),
+      );
+    }
   }
 
   Widget _buildTaskListTab({required bool completed}) {
@@ -3891,12 +4562,16 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
     final filtered = allTasks.where((t) {
       final uid = user?.uid ?? '';
       final assigned = List<String>.from(t['assignedJuniorIds'] ?? const []);
+      final assignedMany = List<String>.from(t['assignedToIds'] ?? const []);
+      final assignedSingle = (t['assignedToId'] ?? '').toString();
       final participants = List<String>.from(t['participantIds'] ?? const []);
       final isOwner = t['createdBy'] == uid;
       final isPublic = t['isPublic'] == true;
-      final isAssigned = assigned.contains(uid);
+      final isAssigned = assigned.contains(uid) ||
+          assignedMany.contains(uid) ||
+          assignedSingle == uid;
       final isParticipant = participants.contains(uid);
-      final isCompleted = t['status'] == 'completed';
+      final isCompleted = _normalizeWorkStatus(t['status']) == 'completed';
       final isVisibleToUser = isOwner || isPublic || isAssigned || isParticipant;
       return isVisibleToUser && (completed ? isCompleted : !isCompleted);
     }).toList();
@@ -3914,6 +4589,7 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       itemBuilder: (context, index) {
         final task = filtered[index];
         final isEscalated = task['isEscalated'] == true;
+        final status = _normalizeWorkStatus(task['status']);
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -3948,9 +4624,9 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   decoration: BoxDecoration(
                     color: isEscalated
                         ? AppColors.error.withOpacity(0.1)
-                        : (task['status'] == 'completed'
+                        : (status == 'completed'
                             ? AppColors.success.withOpacity(0.1)
-                        : task['status'] == 'inProgress'
+                        : status == 'inProgress'
                           ? Colors.blue.withOpacity(0.1)
                             : AppColors.warning.withOpacity(0.1)),
                     borderRadius: BorderRadius.circular(8),
@@ -3958,15 +4634,15 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   child: Text(
                     isEscalated
                         ? 'ESCALATED'
-                        : _taskStatusLabel((task['status'] ?? 'pending').toString()),
+                        : _taskStatusLabel(status),
                     style: TextStyle(
                       fontSize: 10,
                       fontWeight: FontWeight.bold,
                       color: isEscalated
                           ? AppColors.error
-                          : (task['status'] == 'completed'
+                          : (status == 'completed'
                               ? AppColors.success
-                            : task['status'] == 'inProgress'
+                            : status == 'inProgress'
                               ? Colors.blue
                               : AppColors.warning),
                     ),
@@ -3988,65 +4664,198 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     const SizedBox(width: 4),
                     Text(
                       task['deadline'] != null
-                          ? 'Due: ${DateFormat('MMM d').format(DateTime.parse(task['deadline']))}'
+                          ? 'Due: ${DateFormat('MMM d, h:mm a').format(DateTime.parse(task['deadline']))}'
                           : 'No deadline',
                       style: const TextStyle(fontSize: 12, color: Colors.grey),
                     ),
                   ],
                 ),
+                const SizedBox(height: 4),
+                Text(
+                  'Assigned: ${DateFormat('MMM d, h:mm a').format(DateTime.tryParse((task['assignedAt'] ?? task['createdAt'] ?? '').toString()) ?? DateTime.now())}',
+                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                ),
               ],
             ),
             trailing: PopupMenuButton<String>(
-              onSelected: (value) {
+              onSelected: (value) async {
+                final isCreator =
+                    (task['createdBy'] ?? '').toString() == (user?.uid ?? '');
+                final uid = (user?.uid ?? '').toString();
+                final assignedJuniorIds =
+                    List<String>.from(task['assignedJuniorIds'] ?? const []);
+                final assignedToIds =
+                    List<String>.from(task['assignedToIds'] ?? const []);
+                final assignedToId = (task['assignedToId'] ?? '').toString();
+                final isAssignedToMe = assignedJuniorIds.contains(uid) ||
+                    assignedToIds.contains(uid) ||
+                    assignedToId == uid;
                 if (value == 'edit') {
+                  if (!isCreator) return;
                   _showEditTaskDialog(task);
                   return;
                 }
-                if (value == 'status_pending') {
-                  _setTaskStatus(task, 'pending');
-                  return;
-                }
                 if (value == 'status_inProgress') {
-                  _setTaskStatus(task, 'inProgress');
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setTaskStatus(task, 'inProgress');
                   return;
                 }
                 if (value == 'status_completed') {
-                  _setTaskStatus(task, 'completed');
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setTaskStatus(task, 'completed');
+                  return;
+                }
+                if (value == 'status_back_inProgress') {
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setTaskStatus(task, 'inProgress');
                   return;
                 }
                 if (value == 'delete') {
-                  if (isInternUser) return;
-                  ref.read(tasksProvider.notifier).deleteTask(task['id']);
+                  if (isInternUser || !isCreator) return;
+                  await ref.read(tasksProvider.notifier).deleteTask(task['id']);
                 }
               },
-              itemBuilder: (ctx) => [
-                const PopupMenuItem<String>(
-                  value: 'edit',
-                  child: Text('Edit Task'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_pending',
-                  child: Text('Mark Pending'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_inProgress',
-                  child: Text('Mark In Progress'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_completed',
-                  child: Text('Mark Completed'),
-                ),
-                if (!isInternUser)
-                  const PopupMenuItem<String>(
+              itemBuilder: (ctx) {
+                final status = _normalizeWorkStatus(task['status']);
+                final uid = (user?.uid ?? '').toString();
+                final isCreator =
+                    (task['createdBy'] ?? '').toString() == uid;
+                final assignedJuniorIds =
+                    List<String>.from(task['assignedJuniorIds'] ?? const []);
+                final assignedToIds =
+                    List<String>.from(task['assignedToIds'] ?? const []);
+                final assignedToId = (task['assignedToId'] ?? '').toString();
+                final isAssignedToMe = assignedJuniorIds.contains(uid) ||
+                    assignedToIds.contains(uid) ||
+                    assignedToId == uid;
+                final items = <PopupMenuEntry<String>>[];
+                if (isCreator && status == 'inProgress') {
+                  items.add(const PopupMenuItem<String>(
+                    value: 'edit',
+                    child: Text('Edit Task'),
+                  ));
+                }
+
+                if (status == 'inProgress') {
+                  if (isAssignedToMe || isCreator) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_completed',
+                      child: Text('Mark Completed'),
+                    ));
+                  }
+                } else if (status == 'completed') {
+                  if (isAssignedToMe || isCreator) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_back_inProgress',
+                      child: Text('Mark In Progress'),
+                    ));
+                  }
+                }
+
+                if (!isInternUser && isCreator) {
+                  items.add(const PopupMenuItem<String>(
                     value: 'delete',
                     child: Text('Delete Task'),
-                  ),
-              ],
+                  ));
+                }
+
+                return items;
+              },
             ),
-            onTap: () => _showEditTaskDialog(task),
+            onTap: () => _showTaskDetailsDialog(task),
           ),
         );
       },
+    );
+  }
+
+  Future<DateTime?> _pickDateTime({
+    required BuildContext context,
+    required DateTime initial,
+  }) async {
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime.now().subtract(const Duration(days: 365)),
+      lastDate: DateTime.now().add(const Duration(days: 3650)),
+    );
+    if (pickedDate == null) return null;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (pickedTime == null) return null;
+
+    return DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+  }
+
+  String _formatDateTime(dynamic raw) {
+    final parsed = DateTime.tryParse((raw ?? '').toString());
+    if (parsed == null) return 'N/A';
+    return DateFormat('dd MMM yyyy, h:mm a').format(parsed);
+  }
+
+  void _showTaskDetailsDialog(Map<String, dynamic> task) {
+    final caseId = (task['caseId'] ?? '').toString();
+    String caseLabel = caseId.isEmpty ? 'Not linked' : caseId;
+    if (caseId.isNotEmpty) {
+      final cases = ref.read(casesProvider);
+      final matched = cases.where((c) => c.cino == caseId);
+      if (matched.isNotEmpty) {
+        caseLabel = '${matched.first.title} ($caseId)';
+      }
+    }
+
+    final assignedIds = <String>{
+      ...List<String>.from(task['assignedJuniorIds'] ?? const []),
+      ...List<String>.from(task['assignedToIds'] ?? const []),
+      (task['assignedToId'] ?? '').toString(),
+    }..removeWhere((id) => id.trim().isEmpty);
+    final assignedToLabel = (task['assignedToName'] ?? '').toString().trim().isNotEmpty
+        ? (task['assignedToName'] ?? '').toString().trim()
+        : (assignedIds.isEmpty ? 'Unassigned' : assignedIds.join(', '));
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(task['title']?.toString() ?? 'Task Details'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Description: ${task['description'] ?? '-'}'),
+              const SizedBox(height: 10),
+              Text('Case: $caseLabel'),
+              const SizedBox(height: 10),
+              Text('Status: ${_taskStatusLabel(_normalizeWorkStatus(task['status']))}'),
+              const SizedBox(height: 10),
+              Text('Deadline: ${_formatDateTime(task['deadline'])}'),
+              const SizedBox(height: 10),
+              Text('Assigned To: $assignedToLabel'),
+              const SizedBox(height: 10),
+              Text('Assigned At: ${_formatDateTime(task['assignedAt'] ?? task['createdAt'])}'),
+              const SizedBox(height: 10),
+              Text('Created At: ${_formatDateTime(task['createdAt'])}'),
+              const SizedBox(height: 10),
+              Text('Created By: ${task['createdByName'] ?? 'Unknown'}'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -4427,13 +5236,11 @@ class _LawyerAssignmentsScreenState
           const SizedBox(height: 8),
           GestureDetector(
             onTap: () async {
-              final date = await showDatePicker(
+              final picked = await _pickAssignmentDateTime(
                 context: context,
-                initialDate: _deadline,
-                firstDate: DateTime.now(),
-                lastDate: DateTime.now().add(const Duration(days: 365)),
+                initial: _deadline,
               );
-              if (date != null) setState(() => _deadline = date);
+              if (picked != null) setState(() => _deadline = picked);
             },
             child: Container(
               padding: const EdgeInsets.all(16),
@@ -4446,7 +5253,7 @@ class _LawyerAssignmentsScreenState
                 children: [
                   const Icon(Icons.calendar_today, color: AppColors.accent),
                   const SizedBox(width: 12),
-                  Text(DateFormat('dd/MM/yyyy').format(_deadline)),
+                  Text(DateFormat('dd/MM/yyyy, h:mm a').format(_deadline)),
                 ],
               ),
             ),
@@ -4543,8 +5350,10 @@ class _LawyerAssignmentsScreenState
     final isInternUser = user.role == 'intern';
 
     if (isInternUser) {
-      _visibility = 'private';
-      _selectedAssigneeIds = [user.uid];
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Only lawyers can create assignments.')),
+      );
+      return;
     }
 
     if (!isInternUser &&
@@ -4575,6 +5384,7 @@ class _LawyerAssignmentsScreenState
       'createdBy': user.uid,
       'createdByName': user.name,
       'deadline': _deadline.toIso8601String(),
+        'visibility': _visibility,
       'assignedToIds': isInternUser
           ? [user.uid]
           : (_visibility == 'private' ? [user.uid] : _selectedAssigneeIds),
@@ -4586,7 +5396,8 @@ class _LawyerAssignmentsScreenState
             : _selectedAssigneeIds)
       ],
       'tag': _tag,
-      'status': 'pending',
+      'status': 'inProgress',
+      'assignedAt': DateTime.now().toIso8601String(),
       'createdAt': DateTime.now().toIso8601String(),
       'updatedAt': DateTime.now().toIso8601String(),
     };
@@ -4643,14 +5454,10 @@ class _LawyerAssignmentsScreenState
 
   String _assignmentStatusLabel(String status) {
     switch (status) {
-      case 'inProgress':
-        return 'IN PROGRESS';
       case 'completed':
         return 'COMPLETED';
-      case 'overdue':
-        return 'OVERDUE';
       default:
-        return 'PENDING';
+        return 'IN PROGRESS';
     }
   }
 
@@ -4667,14 +5474,58 @@ class _LawyerAssignmentsScreenState
   }
 
   Future<void> _showEditAssignmentDialog(Map<String, dynamic> assignment) async {
+    final currentUser = ref.read(currentUserProvider);
     final titleController =
         TextEditingController(text: assignment['title'] ?? '');
     final descriptionController =
         TextEditingController(text: assignment['description'] ?? '');
+    final activeCases = ref.read(casesProvider).where((c) => !c.isClosed).toList();
+    final members = ref.read(firmMembersProvider).valueOrNull ?? [];
     DateTime selectedDeadline = assignment['deadline'] != null
         ? DateTime.tryParse(assignment['deadline']) ?? DateTime.now()
         : DateTime.now();
     String selectedTag = (assignment['tag'] ?? 'normal').toString();
+    String selectedVisibility = (assignment['visibility'] ?? 'private').toString();
+    String? selectedCaseId = (assignment['caseId'] ?? '').toString().trim().isEmpty
+      ? null
+      : (assignment['caseId'] ?? '').toString();
+    final selectedAssigneeIds = <String>{
+      ...List<String>.from(assignment['assignedToIds'] ?? const []),
+      ...List<String>.from(assignment['assignedJuniorIds'] ?? const []),
+      (assignment['assignedToId'] ?? '').toString(),
+    }..removeWhere((id) => id.trim().isEmpty);
+
+    // Backward-compatible fallback: if explicit assignee fields are empty,
+    // treat participants (except creator/current user) as selected assignees.
+    if (selectedAssigneeIds.isEmpty) {
+      final creatorId = (assignment['createdBy'] ?? '').toString();
+      final fallbackParticipantIds =
+          List<String>.from(assignment['participantIds'] ?? const [])
+              .where((id) =>
+                  id.trim().isNotEmpty &&
+                  id != creatorId &&
+                  id != (currentUser?.uid ?? ''))
+              .toList();
+      selectedAssigneeIds.addAll(fallbackParticipantIds);
+    }
+
+    // Keep existing assignees visible in the role-filtered selector.
+    if (selectedVisibility == 'private' && selectedAssigneeIds.isNotEmpty) {
+      final selectedMembers = members
+          .where((m) => selectedAssigneeIds.contains(m.uid))
+          .toList();
+      final allLawyers = selectedMembers.isNotEmpty &&
+          selectedMembers.every((m) =>
+              (m.role as String).toLowerCase() == 'lawyer');
+      final allInterns = selectedMembers.isNotEmpty &&
+          selectedMembers.every((m) =>
+              (m.role as String).toLowerCase() == 'intern');
+      if (allLawyers) {
+        selectedVisibility = 'lawyers';
+      } else if (allInterns) {
+        selectedVisibility = 'interns';
+      }
+    }
 
     final shouldSave = await showDialog<bool>(
       context: context,
@@ -4697,8 +5548,30 @@ class _LawyerAssignmentsScreenState
                     decoration: const InputDecoration(labelText: 'Description'),
                   ),
                   const SizedBox(height: 12),
+                  DropdownButtonFormField<String?>(
+                    value: selectedCaseId,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Linked Case'),
+                    items: [
+                      const DropdownMenuItem<String?>(
+                        value: null,
+                        child: Text('None'),
+                      ),
+                      ...activeCases.map(
+                        (c) => DropdownMenuItem<String?>(
+                          value: c.cino,
+                          child: Text(c.title, overflow: TextOverflow.ellipsis),
+                        ),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      setDialogState(() => selectedCaseId = value);
+                    },
+                  ),
+                  const SizedBox(height: 12),
                   DropdownButtonFormField<String>(
                     value: selectedTag,
+                    isExpanded: true,
                     decoration: const InputDecoration(labelText: 'Priority'),
                     items: const [
                       DropdownMenuItem(value: 'urgent', child: Text('Urgent')),
@@ -4711,14 +5584,217 @@ class _LawyerAssignmentsScreenState
                       setDialogState(() => selectedTag = value);
                     },
                   ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Assign to',
+                    style: TextStyle(color: Colors.grey[700]),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() {
+                            selectedVisibility = 'private';
+                            selectedAssigneeIds.clear();
+                          }),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'private'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'private'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.lock, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Private',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() => selectedVisibility = 'lawyers'),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'lawyers'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'lawyers'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.gavel, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Lawyers',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: GestureDetector(
+                          onTap: () => setDialogState(() => selectedVisibility = 'interns'),
+                          child: Container(
+                            height: 84,
+                            padding: const EdgeInsets.symmetric(horizontal: 8),
+                            decoration: BoxDecoration(
+                              color: selectedVisibility == 'interns'
+                                  ? AppColors.accent.withOpacity(0.1)
+                                  : AppColors.white,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(
+                                color: selectedVisibility == 'interns'
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2,
+                              ),
+                            ),
+                            child: const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.school, size: 20),
+                                SizedBox(height: 4),
+                                FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: Text(
+                                    'Interns',
+                                    maxLines: 1,
+                                    softWrap: false,
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (selectedVisibility == 'lawyers' || selectedVisibility == 'interns') ...[
+                    const SizedBox(height: 12),
+                    Builder(
+                      builder: (_) {
+                        final filteredMembers = members
+                            .where((m) =>
+                                m.uid != currentUser?.uid &&
+                                (m.role as String).toLowerCase() ==
+                                    (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
+                            .toList();
+                        final allSelected = filteredMembers.isNotEmpty &&
+                            filteredMembers.every((m) => selectedAssigneeIds.contains(m.uid));
+                        return Align(
+                          alignment: Alignment.centerRight,
+                          child: TextButton(
+                            onPressed: () {
+                              setDialogState(() {
+                                if (allSelected) {
+                                  for (final m in filteredMembers) {
+                                    selectedAssigneeIds.remove(m.uid);
+                                  }
+                                } else {
+                                  for (final m in filteredMembers) {
+                                    selectedAssigneeIds.add(m.uid);
+                                  }
+                                }
+                              });
+                            },
+                            child: Text(allSelected ? 'Deselect All' : 'Select All'),
+                          ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 8),
+                    ...members
+                        .where((m) =>
+                            m.uid != currentUser?.uid &&
+                            (m.role as String).toLowerCase() ==
+                                (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
+                        .map((m) {
+                      final selected = selectedAssigneeIds.contains(m.uid);
+                      return GestureDetector(
+                        onTap: () {
+                          setDialogState(() {
+                            if (selected) {
+                              selectedAssigneeIds.remove(m.uid);
+                            } else {
+                              selectedAssigneeIds.add(m.uid);
+                            }
+                          });
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: selected
+                                ? AppColors.accent.withOpacity(0.1)
+                                : AppColors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(
+                                color: selected
+                                    ? AppColors.accent
+                                    : Colors.grey[300]!,
+                                width: 2),
+                          ),
+                          child: Row(
+                            children: [
+                              AvatarCircle(initials: m.initials, size: 32),
+                              const SizedBox(width: 10),
+                              Expanded(child: Text(m.name)),
+                              if (selected)
+                                const Icon(Icons.check_circle,
+                                    color: AppColors.accent, size: 18),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
                   const SizedBox(height: 8),
                   TextButton.icon(
                     onPressed: () async {
-                      final picked = await showDatePicker(
+                      final picked = await _pickAssignmentDateTime(
                         context: ctx,
-                        initialDate: selectedDeadline,
-                        firstDate: DateTime.now().subtract(const Duration(days: 365)),
-                        lastDate: DateTime.now().add(const Duration(days: 3650)),
+                        initial: selectedDeadline,
                       );
                       if (picked != null) {
                         setDialogState(() => selectedDeadline = picked);
@@ -4726,7 +5802,7 @@ class _LawyerAssignmentsScreenState
                     },
                     icon: const Icon(Icons.calendar_today),
                     label: Text(
-                        'Deadline: ${DateFormat('dd/MM/yyyy').format(selectedDeadline)}'),
+                        'Deadline: ${DateFormat('dd/MM/yyyy, h:mm a').format(selectedDeadline)}'),
                   ),
                 ],
               ),
@@ -4755,19 +5831,45 @@ class _LawyerAssignmentsScreenState
       return;
     }
 
-    await ref.read(assignmentsProvider.notifier).updateAssignment(
-      assignment['id'],
-      {
-        'title': titleController.text.trim(),
-        'description': descriptionController.text.trim(),
-        'deadline': selectedDeadline.toIso8601String(),
-        'tag': selectedTag,
-      },
-    );
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Assignment updated successfully')),
-    );
+    final assigneeIds = selectedAssigneeIds.isEmpty
+        ? <String>{(assignment['createdBy'] ?? '').toString()}
+        : selectedAssigneeIds;
+    final assigneeNames = members
+        .where((m) => assigneeIds.contains(m.uid))
+        .map((m) => m.name)
+        .toList();
+    final participants = <String>{
+      (assignment['createdBy'] ?? '').toString(),
+      ...assigneeIds,
+    }..removeWhere((id) => id.trim().isEmpty);
+
+    try {
+      await ref.read(assignmentsProvider.notifier).updateAssignment(
+        assignment['id'],
+        {
+          'title': titleController.text.trim(),
+          'description': descriptionController.text.trim(),
+          'deadline': selectedDeadline.toIso8601String(),
+          'tag': selectedTag,
+          'visibility': selectedVisibility,
+          'caseId': selectedCaseId,
+          'assignedToIds': assigneeIds.toList(),
+          'assignedToId': assigneeIds.first,
+          'assignedToName':
+              assigneeNames.isEmpty ? 'Unassigned' : assigneeNames.join(', '),
+          'participantIds': participants.toList(),
+        },
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Assignment updated successfully')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unable to save assignment edits: $e')),
+      );
+    }
   }
 
   Widget _buildAssignmentListTab({required bool completed}) {
@@ -4783,8 +5885,8 @@ class _LawyerAssignmentsScreenState
           .contains(user?.uid) ||
         (a['assignedToId'] ?? '').toString() == (user?.uid ?? ''))
         .where((a) => completed
-            ? (a['status'] ?? 'pending') == 'completed'
-            : (a['status'] ?? 'pending') != 'completed')
+          ? _normalizeWorkStatus(a['status']) == 'completed'
+          : _normalizeWorkStatus(a['status']) != 'completed')
         .toList()
       ..sort((a, b) => (b['createdAt'] ?? '')
           .toString()
@@ -4802,17 +5904,16 @@ class _LawyerAssignmentsScreenState
       itemCount: assignments.length,
       itemBuilder: (context, index) {
         final a = assignments[index];
+        final status = _normalizeWorkStatus(a['status']);
         final tagColor = a['tag'] == 'urgent'
             ? AppColors.error
             : a['tag'] == 'highPriority'
                 ? AppColors.warning
                 : AppColors.success;
-        final statusColor = a['status'] == 'completed'
+        final statusColor = status == 'completed'
           ? AppColors.success
-          : a['status'] == 'inProgress'
+          : status == 'inProgress'
             ? Colors.blue
-            : a['status'] == 'overdue'
-              ? AppColors.error
               : AppColors.warning;
 
         return Container(
@@ -4870,17 +5971,29 @@ class _LawyerAssignmentsScreenState
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 const SizedBox(height: 8),
                 Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
-                    const Icon(Icons.calendar_today,
-                        size: 12, color: Colors.grey),
-                    const SizedBox(width: 4),
-                    Text(
-                      a['deadline'] != null
-                          ? 'Due: ${DateFormat('MMM d').format(DateTime.parse(a['deadline']))}'
-                          : '',
-                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                    Expanded(
+                      child: Row(
+                        children: [
+                          const Icon(Icons.calendar_today,
+                              size: 12, color: Colors.grey),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              a['deadline'] != null
+                                  ? 'Due: ${DateFormat('MMM d, h:mm a').format(DateTime.parse(a['deadline']))}'
+                                  : '',
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.grey),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                    const Spacer(),
+                    const SizedBox(width: 8),
                     Container(
                       padding: const EdgeInsets.symmetric(
                           horizontal: 8, vertical: 4),
@@ -4889,8 +6002,7 @@ class _LawyerAssignmentsScreenState
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: Text(
-                        _assignmentStatusLabel(
-                            (a['status'] ?? 'pending').toString()),
+                        _assignmentStatusLabel(status),
                         style: TextStyle(
                             fontSize: 10,
                             color: statusColor,
@@ -4899,61 +6011,187 @@ class _LawyerAssignmentsScreenState
                     ),
                   ],
                 ),
+                const SizedBox(height: 4),
+                Text(
+                  'Assigned: ${DateFormat('MMM d, h:mm a').format(DateTime.tryParse((a['assignedAt'] ?? a['createdAt'] ?? '').toString()) ?? DateTime.now())}',
+                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                ),
               ],
             ),
             trailing: PopupMenuButton<String>(
-              onSelected: (value) {
+              onSelected: (value) async {
+                final isCreator = (a['createdBy'] ?? '').toString() ==
+                    (user?.uid ?? '');
+                final uid = (user?.uid ?? '').toString();
+                final assignedToIds =
+                    List<String>.from(a['assignedToIds'] ?? const []);
+                final assignedToId = (a['assignedToId'] ?? '').toString();
+                final isAssignedToMe =
+                    assignedToIds.contains(uid) || assignedToId == uid;
                 if (value == 'edit') {
+                  if (!isCreator) return;
                   _showEditAssignmentDialog(a);
                   return;
                 }
-                if (value == 'status_pending') {
-                  _setAssignmentStatus(a, 'pending');
-                  return;
-                }
                 if (value == 'status_inProgress') {
-                  _setAssignmentStatus(a, 'inProgress');
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setAssignmentStatus(a, 'inProgress');
                   return;
                 }
                 if (value == 'status_completed') {
-                  _setAssignmentStatus(a, 'completed');
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setAssignmentStatus(a, 'completed');
+                  return;
+                }
+                if (value == 'status_back_inProgress') {
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setAssignmentStatus(a, 'inProgress');
                   return;
                 }
                 if (value == 'delete') {
-                  if (isInternUser) return;
-                  ref
+                  if (isInternUser || !isCreator) return;
+                  await ref
                       .read(assignmentsProvider.notifier)
                       .deleteAssignment(a['id']);
                 }
               },
-              itemBuilder: (ctx) => [
-                const PopupMenuItem<String>(
-                  value: 'edit',
-                  child: Text('Edit Assignment'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_pending',
-                  child: Text('Mark Pending'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_inProgress',
-                  child: Text('Mark In Progress'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'status_completed',
-                  child: Text('Mark Completed'),
-                ),
-                if (!isInternUser)
-                  const PopupMenuItem<String>(
+              itemBuilder: (ctx) {
+                final status = _normalizeWorkStatus(a['status']);
+                final uid = (user?.uid ?? '').toString();
+                final isCreator = (a['createdBy'] ?? '').toString() ==
+                    uid;
+                final assignedToIds =
+                    List<String>.from(a['assignedToIds'] ?? const []);
+                final assignedToId = (a['assignedToId'] ?? '').toString();
+                final isAssignedToMe =
+                    assignedToIds.contains(uid) || assignedToId == uid;
+                final items = <PopupMenuEntry<String>>[];
+                if (isCreator && status == 'inProgress') {
+                  items.add(const PopupMenuItem<String>(
+                    value: 'edit',
+                    child: Text('Edit Assignment'),
+                  ));
+                }
+
+                if (status == 'inProgress') {
+                  if (isAssignedToMe || isCreator) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_completed',
+                      child: Text('Mark Completed'),
+                    ));
+                  }
+                } else if (status == 'completed') {
+                  if (isAssignedToMe || isCreator) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_back_inProgress',
+                      child: Text('Mark In Progress'),
+                    ));
+                  }
+                }
+
+                if (!isInternUser && isCreator) {
+                  items.add(const PopupMenuItem<String>(
                     value: 'delete',
                     child: Text('Delete Assignment'),
-                  ),
-              ],
+                  ));
+                }
+
+                return items;
+              },
             ),
-            onTap: () => _showEditAssignmentDialog(a),
+            onTap: () => _showAssignmentDetailsDialog(a),
           ),
         );
       },
+    );
+  }
+
+  Future<DateTime?> _pickAssignmentDateTime({
+    required BuildContext context,
+    required DateTime initial,
+  }) async {
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime.now().subtract(const Duration(days: 365)),
+      lastDate: DateTime.now().add(const Duration(days: 3650)),
+    );
+    if (pickedDate == null) return null;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (pickedTime == null) return null;
+
+    return DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+  }
+
+  String _formatAssignmentDateTime(dynamic raw) {
+    final parsed = DateTime.tryParse((raw ?? '').toString());
+    if (parsed == null) return 'N/A';
+    return DateFormat('dd MMM yyyy, h:mm a').format(parsed);
+  }
+
+  void _showAssignmentDetailsDialog(Map<String, dynamic> assignment) {
+    final caseId = (assignment['caseId'] ?? '').toString();
+    String caseLabel = caseId.isEmpty ? 'Not linked' : caseId;
+    if (caseId.isNotEmpty) {
+      final cases = ref.read(casesProvider);
+      final matched = cases.where((c) => c.cino == caseId);
+      if (matched.isNotEmpty) {
+        caseLabel = '${matched.first.title} ($caseId)';
+      }
+    }
+
+    final assignedIds = <String>{
+      ...List<String>.from(assignment['assignedToIds'] ?? const []),
+      (assignment['assignedToId'] ?? '').toString(),
+    }..removeWhere((id) => id.trim().isEmpty);
+    final assignedToLabel = (assignment['assignedToName'] ?? '').toString().trim().isNotEmpty
+        ? (assignment['assignedToName'] ?? '').toString().trim()
+        : (assignedIds.isEmpty ? 'Unassigned' : assignedIds.join(', '));
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(assignment['title']?.toString() ?? 'Assignment Details'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Description: ${assignment['description'] ?? '-'}'),
+              const SizedBox(height: 10),
+              Text('Case: $caseLabel'),
+              const SizedBox(height: 10),
+              Text('Status: ${_assignmentStatusLabel(_normalizeWorkStatus(assignment['status']))}'),
+              const SizedBox(height: 10),
+              Text('Deadline: ${_formatAssignmentDateTime(assignment['deadline'])}'),
+              const SizedBox(height: 10),
+              Text('Assigned To: $assignedToLabel'),
+              const SizedBox(height: 10),
+              Text('Assigned At: ${_formatAssignmentDateTime(assignment['assignedAt'] ?? assignment['createdAt'])}'),
+              const SizedBox(height: 10),
+              Text('Created At: ${_formatAssignmentDateTime(assignment['createdAt'])}'),
+              const SizedBox(height: 10),
+              Text('Created By: ${assignment['createdByName'] ?? 'Unknown'}'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -5026,14 +6264,23 @@ class _LawyerWorkScreenState extends State<LawyerWorkScreen>
             color: AppColors.primary,
             child: Column(
               children: [
-                const Text(
-                  'My Work',
-                  style: TextStyle(
-                      color: AppColors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600),
+                Row(
+                  children: [
+                    _buildBackButton(context),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'My Work',
+                        style: TextStyle(
+                          color: AppColors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 16),
+                const SizedBox(height: 12),
                 TabBar(
                   controller: _tabController,
                   labelColor: AppColors.accent,

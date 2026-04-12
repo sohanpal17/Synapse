@@ -1,21 +1,93 @@
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import '../models/user_model.dart';
+import '../config/admin_config.dart';
 import 'hive_service.dart';
+import 'notification_service.dart';
 
 /// Handles authentication and user management
 /// Single firm model — all users belong to firm "synapse_default"
 class AuthService {
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final FirebaseFunctions _functions =
+      FirebaseFunctions.instanceFor(region: 'asia-south1');
+  static const String _firmMembersCacheKey = 'firm_members_cache';
+  static List<UserModel> _firmMembersMemoryCache = const [];
 
   /// Current Firebase user
   User? get currentUser => _auth.currentUser;
 
   /// Auth state stream
   Stream<User?> get authStateChanges => _auth.authStateChanges();
+
+  String _normalizePhone(String raw) => raw.replaceAll(RegExp(r'\D'), '');
+
+  bool _isValidPhone10(String raw) => _normalizePhone(raw).length == 10;
+
+  String _buildInitials(String name) {
+    final parts = name
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((w) => w.isNotEmpty)
+        .toList();
+    if (parts.isEmpty) return '';
+    return parts.map((w) => w[0].toUpperCase()).take(2).join();
+  }
+
+  List<UserModel> _sortFirmMembers(List<UserModel> members) {
+    final sorted = List<UserModel>.from(members);
+    sorted.sort((a, b) {
+      const order = {'lawyer': 0, 'intern': 1, 'client': 2};
+      return (order[a.role] ?? 3).compareTo(order[b.role] ?? 3);
+    });
+    return sorted;
+  }
+
+  Future<void> _saveFirmMembersCache(List<UserModel> members) async {
+    final payload = members.map((m) => m.toMap()).toList();
+    await HiveService.saveSetting(_firmMembersCacheKey, payload);
+    _firmMembersMemoryCache = members;
+  }
+
+  List<UserModel> _readFirmMembersCache() {
+    if (_firmMembersMemoryCache.isNotEmpty) {
+      return _firmMembersMemoryCache;
+    }
+
+    try {
+      final raw = HiveService.getSetting(_firmMembersCacheKey);
+      if (raw is! List) return const [];
+
+      final members = raw
+          .whereType<Map>()
+          .map((e) => UserModel.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+      _firmMembersMemoryCache = members;
+      return members;
+    } catch (e) {
+      debugPrint('Failed to read firm member cache: $e');
+      return const [];
+    }
+  }
+
+  bool _sameFirmMembers(List<UserModel> a, List<UserModel> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i].uid != b[i].uid ||
+          a[i].name != b[i].name ||
+          a[i].role != b[i].role ||
+          a[i].isActive != b[i].isActive ||
+          a[i].approvalStatus != b[i].approvalStatus) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   // ══════════ REGISTER ══════════
 
@@ -28,6 +100,11 @@ class AuthService {
     required String role,
     String phone = '',
   }) async {
+    final normalizedPhone = _normalizePhone(phone.trim());
+    if (!_isValidPhone10(normalizedPhone)) {
+      throw Exception('Phone number must be exactly 10 digits.');
+    }
+
     // 1. Create Firebase Auth account
     final credential = await _auth.createUserWithEmailAndPassword(
       email: email.trim(),
@@ -49,8 +126,10 @@ class AuthService {
       uid: uid,
       name: name.trim(),
       email: email.trim(),
-      phone: phone.trim(),
+      phone: normalizedPhone,
       role: role,
+      approvalStatus: 'pending',
+      isActive: false,
     );
 
     // 3. Write user to Firestore (Wait up to 10 seconds to ensure they are created in the cloud)
@@ -69,10 +148,84 @@ class AuthService {
       throw Exception('Failed to finalize registration in the cloud database. Error: $e');
     }
 
+    try {
+      await _db.collection('onboarding_requests').doc(uid).set({
+        'uid': uid,
+        'name': name.trim(),
+        'email': email.trim(),
+        'phone': normalizedPhone,
+        'role': role,
+        'status': 'pending',
+        'requestedAt': DateTime.now().toIso8601String(),
+      });
+    } catch (e) {
+      debugPrint('Failed to create onboarding request: $e');
+      // Roll back partially created account to avoid "registered but invisible" users.
+      try {
+        await _db.collection('users').doc(uid).delete();
+      } catch (_) {}
+      try {
+        await credential.user?.delete();
+      } catch (_) {}
+      throw Exception('Failed to submit onboarding request. Error: $e');
+    }
+
     // 4. Always cache locally so app works immediately
     await HiveService.put(HiveService.userBox, 'current_user', user.toMap());
 
     return user;
+  }
+
+  Future<UserModel> loginAsAdmin(String email, String password) async {
+    if (email.trim().toLowerCase() != kAdminEmail.toLowerCase() ||
+        password != kAdminPassword) {
+      throw Exception('Invalid admin credentials.');
+    }
+
+    UserCredential credential;
+    try {
+      credential = await _auth.signInWithEmailAndPassword(
+        email: email.trim(),
+        password: password.trim(),
+      );
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'user-not-found' || e.code == 'invalid-credential') {
+        try {
+          credential = await _auth.createUserWithEmailAndPassword(
+            email: email.trim(),
+            password: password.trim(),
+          );
+        } on FirebaseAuthException catch (createError) {
+          if (createError.code == 'email-already-in-use') {
+            throw Exception(
+              'Admin email already exists with a different password. '
+              'Use the existing password or reset/delete this auth user in Firebase Console.'
+            );
+          }
+          rethrow;
+        }
+      } else {
+        rethrow;
+      }
+    }
+
+    final uid = credential.user!.uid;
+    final adminUser = UserModel(
+      uid: uid,
+      name: 'Platform Admin',
+      email: email.trim(),
+      role: 'admin',
+      approvalStatus: 'approved',
+      isActive: true,
+    );
+
+    await _db.collection('users').doc(uid).set(
+          adminUser.toMap(),
+          SetOptions(merge: true),
+        );
+
+    await HiveService.put(HiveService.userBox, 'current_user', adminUser.toMap());
+    return adminUser;
   }
 
   // ══════════ LOGIN ══════════
@@ -91,7 +244,10 @@ class AuthService {
     try {
       final doc = await _db.collection('users').doc(uid).get().timeout(const Duration(seconds: 8));
       if (doc.exists) {
-        final user = UserModel.fromMap(doc.data()!);
+        final map = Map<String, dynamic>.from(doc.data()!);
+        map.putIfAbsent('uid', () => doc.id);
+        final user = UserModel.fromMap(map);
+        await _ensurePendingOnboardingRequest(user);
         await HiveService.put(HiveService.userBox, 'current_user', user.toMap());
         return user;
       }
@@ -121,53 +277,74 @@ class AuthService {
 
   /// Sign out and clear local data
   Future<void> logout() async {
+    await NotificationService.unbindCurrentDeviceToken(
+      uid: _auth.currentUser?.uid,
+    );
     await _auth.signOut();
     await HiveService.clearAllData();
+  }
+
+  /// Permanently delete the current account and all related cloud data.
+  Future<void> deleteOwnAccount() async {
+    await _functions.httpsCallable('deleteOwnAccount').call();
   }
 
   // ══════════ FIRM MEMBERS ══════════
 
   /// Get all members of the firm (for team directory)
   Future<List<UserModel>> getFirmMembers() async {
-    final snapshot = await _db.collection('users').get();
-    
-    final members = snapshot.docs.map((doc) {
-      try {
-        return UserModel.fromMap(doc.data());
-      } catch (e) {
-        debugPrint('Failed to parse user ${doc.id}: $e');
-        return null;
-      }
-    }).whereType<UserModel>().toList();
-    
-    // Sort: lawyers first, then interns, then clients
-    members.sort((a, b) {
-      const order = {'lawyer': 0, 'intern': 1, 'client': 2};
-      return (order[a.role] ?? 3).compareTo(order[b.role] ?? 3);
-    });
+    final cached = _readFirmMembersCache();
+    try {
+      final result = await _functions
+          .httpsCallable('listFirmMembers')
+          .call()
+          .timeout(const Duration(seconds: 8));
+      final data = result.data;
+      if (data is! Map) return cached;
+      final items = data['items'];
+      if (items is! List) return cached;
 
-    return members;
-  }
-
-  /// Real-time stream of all members of the firm
-  Stream<List<UserModel>> watchFirmMembers() {
-    return _db.collection('users').snapshots().map((snapshot) {
-      final members = snapshot.docs.map((doc) {
+      final members = items.map((raw) {
         try {
-          return UserModel.fromMap(doc.data());
+          final map = Map<String, dynamic>.from(raw as Map);
+          return UserModel.fromMap(map);
         } catch (e) {
-          debugPrint('Failed to parse user ${doc.id}: $e');
+          debugPrint('Failed to parse firm member payload: $e');
           return null;
         }
       }).whereType<UserModel>().toList();
-      
-      members.sort((a, b) {
-        const order = {'lawyer': 0, 'intern': 1, 'client': 2};
-        return (order[a.role] ?? 3).compareTo(order[b.role] ?? 3);
-      });
-      
-      return members;
-    });
+
+      final sorted = _sortFirmMembers(members);
+      await _saveFirmMembersCache(sorted);
+      return sorted;
+    } catch (e) {
+      debugPrint('Failed to load firm members from callable: $e');
+      return cached;
+    }
+  }
+
+  /// Real-time stream of all members of the firm
+  Stream<List<UserModel>> watchFirmMembers() async* {
+    final cached = _sortFirmMembers(_readFirmMembersCache());
+    if (cached.isNotEmpty) {
+      yield cached;
+    }
+
+    final firstFetch = _sortFirmMembers(await getFirmMembers());
+    if (firstFetch.isNotEmpty && !_sameFirmMembers(firstFetch, cached)) {
+      yield firstFetch;
+    }
+
+    var previous = firstFetch.isNotEmpty ? firstFetch : cached;
+    while (true) {
+      await Future.delayed(const Duration(seconds: 12));
+      final next = _sortFirmMembers(await getFirmMembers());
+      if (_sameFirmMembers(next, previous)) {
+        continue;
+      }
+      previous = next;
+      yield next;
+    }
   }
 
   /// Get only lawyers
@@ -208,6 +385,11 @@ class AuthService {
     return all.where((m) => m.isTeamMember).toList();
   }
 
+  /// Return locally cached firm members immediately (memory/Hive), no network.
+  List<UserModel> getCachedFirmMembers() {
+    return _sortFirmMembers(_readFirmMembersCache());
+  }
+
   // ══════════ USER PROFILE ══════════
 
   /// Update user profile
@@ -218,15 +400,24 @@ class AuthService {
   }) async {
     final updates = <String, dynamic>{};
     if (name != null) {
-      updates['name'] = name;
+      final trimmedName = name.trim();
+      updates['name'] = trimmedName;
+      updates['initials'] = _buildInitials(trimmedName);
       // Keep Firebase Auth profile synced so login offline fallbacks don't revert
       try {
-        await _auth.currentUser?.updateDisplayName(name.trim());
+        await _auth.currentUser?.updateDisplayName(trimmedName);
       } catch (e) {
         debugPrint('Failed to update displayName on Firebase user: $e');
       }
     }
-    if (phone != null) updates['phone'] = phone;
+    if (phone != null) {
+      final normalizedPhone = _normalizePhone(phone);
+      if (!_isValidPhone10(normalizedPhone)) {
+        throw Exception('Phone number must be exactly 10 digits.');
+      }
+      updates['phone'] = normalizedPhone;
+      phone = normalizedPhone;
+    }
 
     if (updates.isNotEmpty) {
       // 1. Update local cache FIRST so the UI feels instant
@@ -248,7 +439,31 @@ class AuthService {
   Future<UserModel?> getUserById(String uid) async {
     final doc = await _db.collection('users').doc(uid).get();
     if (!doc.exists) return null;
-    return UserModel.fromMap(doc.data()!);
+    final map = Map<String, dynamic>.from(doc.data()!);
+    map.putIfAbsent('uid', () => doc.id);
+    return UserModel.fromMap(map);
+  }
+
+  Future<void> _ensurePendingOnboardingRequest(UserModel user) async {
+    if (user.isAdmin || user.isApproved || user.isActive) return;
+
+    try {
+      final ref = _db.collection('onboarding_requests').doc(user.uid);
+      final req = await ref.get();
+      if (req.exists) return;
+
+      await ref.set({
+        'uid': user.uid,
+        'name': user.name,
+        'email': user.email,
+        'phone': user.phone,
+        'role': user.role,
+        'status': 'pending',
+        'requestedAt': DateTime.now().toIso8601String(),
+      });
+    } catch (e) {
+      debugPrint('Failed ensuring onboarding request for ${user.uid}: $e');
+    }
   }
 
   Future<void> _deleteDocumentRefsInBatches(

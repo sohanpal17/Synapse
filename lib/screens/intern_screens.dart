@@ -6,6 +6,7 @@ import '../main.dart';
 import '../widgets/common_widgets.dart';
 import '../providers/providers.dart';
 import '../services/notification_service.dart';
+import '../utils/date_formatter.dart';
 
 // ==================== INTERN DASHBOARD ====================
 class InternDashboard extends ConsumerStatefulWidget {
@@ -15,13 +16,56 @@ class InternDashboard extends ConsumerStatefulWidget {
   ConsumerState<InternDashboard> createState() => _InternDashboardState();
 }
 
-class _InternDashboardState extends ConsumerState<InternDashboard> {
+class _InternDashboardState extends ConsumerState<InternDashboard> with WidgetsBindingObserver {
   int _currentNavIndex = 0;
   final Set<String> _seenSosAlertIds = <String>{};
   bool _showSosBlink = false;
   bool _blinkOn = false;
   Timer? _blinkTicker;
   Timer? _blinkStopper;
+  StreamSubscription<Map<String, dynamic>>? _sosBlinkSub;
+
+  // ══════════ SINGLE UNIFIED SOS HANDLER ══════════
+
+  void _handleSos({
+    required String sosId,
+    required String sentBy,
+    String senderName = 'Team member',
+    String caseName = 'Unknown case',
+    String courtRoom = '',
+    bool isRecent = true,
+  }) {
+    if (sosId.isEmpty) return;
+    if (_seenSosAlertIds.contains(sosId)) return;
+    if (!isRecent) return;
+
+    // Defer processing if app is not in the foreground.
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    final isForeground = lifecycleState == AppLifecycleState.resumed || lifecycleState == null;
+    if (!isForeground) return;
+
+    _seenSosAlertIds.add(sosId);
+
+    final user = ref.read(currentUserProvider);
+    final currentUid = user?.uid ?? '';
+    if (sentBy.isNotEmpty && sentBy == currentUid) return;
+    if (_showSosBlink) return;
+
+    _triggerSosBlink();
+    NotificationService.playSosNotificationAudioFor3Seconds();
+    NotificationService.markSosBlinkConsumed(sosId);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('SOS received from $senderName ($caseName)'),
+          backgroundColor: AppColors.error,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
 
   void _triggerSosBlink() {
     _blinkTicker?.cancel();
@@ -54,42 +98,19 @@ class _InternDashboardState extends ConsumerState<InternDashboard> {
     alertsAsync.whenData((alerts) {
       for (final alert in alerts) {
         final id = (alert['id'] ?? '').toString();
-        if (id.isEmpty || _seenSosAlertIds.contains(id)) continue;
-
-        final timestampRaw = (alert['timestamp'] ?? '').toString();
-        final sentAt = DateTime.tryParse(timestampRaw);
+        final sentAt = DateFormatter.parseDateNullable(
+          alert['timestamp'] ?? alert['createdAt'],
+        );
         final isRecent = sentAt != null &&
             DateTime.now().difference(sentAt) <= const Duration(minutes: 2);
 
-        _seenSosAlertIds.add(id);
-
-        if (NotificationService.shouldSuppressSosVisual(sosId: id)) {
-          continue;
-        }
-
-        // Ignore stale SOS alerts to avoid confusion when opening app much later.
-        if (!isRecent) continue;
-
-        if ((alert['sentBy'] ?? '').toString() == currentUid) continue;
-
-        _triggerSosBlink();
-
-        if (mounted) {
-          final senderName =
-              (alert['sentByName'] ?? 'Team member').toString();
-          final caseName = (alert['caseName'] ?? 'Unknown case').toString();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('SOS received from $senderName ($caseName)'),
-              backgroundColor: AppColors.error,
-            ),
-          );
-        }
-
-        NotificationService.showSOSAlert(
+        _handleSos(
+          sosId: id,
+          sentBy: (alert['sentBy'] ?? '').toString(),
           senderName: (alert['sentByName'] ?? 'Team member').toString(),
           caseName: (alert['caseName'] ?? 'Unknown case').toString(),
-          courtRoom: (alert['courtRoom'] ?? 'Unknown courtroom').toString(),
+          courtRoom: (alert['courtRoom'] ?? '').toString(),
+          isRecent: isRecent,
         );
       }
     });
@@ -97,23 +118,100 @@ class _InternDashboardState extends ConsumerState<InternDashboard> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _blinkTicker?.cancel();
     _blinkStopper?.cancel();
+    _sosBlinkSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      final user = ref.read(currentUserProvider);
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final memoryBlinks = NotificationService.consumePendingSosBlinks();
+        for (final blink in memoryBlinks) {
+          _handleSos(
+            sosId: (blink['sosId'] ?? '').toString(),
+            sentBy: (blink['sentBy'] ?? '').toString(),
+            senderName: (blink['sentByName'] ?? 'Team member').toString(),
+            caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+            courtRoom: (blink['courtRoom'] ?? '').toString(),
+          );
+        }
+
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _sosBlinkSub = NotificationService.sosBlinkStream.listen((data) {
+      _handleSos(
+        sosId: (data['sosId'] ?? '').toString(),
+        sentBy: (data['sentBy'] ?? '').toString(),
+        senderName: (data['sentByName'] ?? 'Team member').toString(),
+        caseName: (data['caseName'] ?? 'Unknown case').toString(),
+        courtRoom: (data['courtRoom'] ?? '').toString(),
+      );
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final memoryBlinks = NotificationService.consumePendingSosBlinks();
+      for (final blink in memoryBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      final hiveBlinks = NotificationService.loadPendingSosBlinksFromHive();
+      for (final blink in hiveBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      final user = ref.read(currentUserProvider);
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final user = ref.watch(currentUserProvider);
-    final sosAlerts = ref.watch(sosAlertsProvider);
+    ref.watch(sosAlertsProvider);
     final allCases = ref.watch(casesProvider);
     final allTasks = ref.watch(tasksProvider);
     final allAssignments = ref.watch(assignmentsProvider);
 
     final uid = user?.uid ?? '';
-    if (uid.isNotEmpty) {
-      _processSosAlerts(sosAlerts, uid);
-    }
+    ref.listen<AsyncValue<List<Map<String, dynamic>>>>(
+      sosAlertsProvider,
+      (previous, next) {
+        if (uid.isNotEmpty) {
+          _processSosAlerts(next, uid);
+        }
+      },
+    );
 
     final myCases = allCases
         .where((c) => !c.isClosed && c.assignedMemberIds.contains(uid))
@@ -396,7 +494,7 @@ class _InternDashboardState extends ConsumerState<InternDashboard> {
                               child: _buildToolButton(
                                 Icons.campaign,
                                 'Notices',
-                                Colors.green,
+                                AppColors.secondary,
                                 () => Navigator.pushNamed(
                                     context, '/notice-board'),
                               ),
@@ -449,15 +547,15 @@ class _InternDashboardState extends ConsumerState<InternDashboard> {
         currentIndex: _currentNavIndex,
         items: const [
           BottomNavItem(icon: Icons.home, label: 'Home'),
+          BottomNavItem(icon: Icons.work, label: 'Work'),
           BottomNavItem(icon: Icons.folder, label: 'Cases'),
-          BottomNavItem(icon: Icons.work_outline, label: 'Work'),
-          BottomNavItem(icon: Icons.calendar_month, label: 'Calendar'),
+          BottomNavItem(icon: Icons.calendar_today, label: 'Calendar'),
           BottomNavItem(icon: Icons.message, label: 'Messages'),
         ],
         onTap: (index) {
           setState(() => _currentNavIndex = index);
-          if (index == 1) Navigator.pushNamed(context, '/my-cases');
-          if (index == 2) Navigator.pushNamed(context, '/lawyer-work');
+          if (index == 1) Navigator.pushNamed(context, '/lawyer-work');
+          if (index == 2) Navigator.pushNamed(context, '/my-cases');
           if (index == 3) Navigator.pushNamed(context, '/personal-calendar');
           if (index == 4) Navigator.pushNamed(context, '/messages');
         },

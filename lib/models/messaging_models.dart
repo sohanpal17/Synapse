@@ -46,6 +46,9 @@ class ChatGroup {
   final String? lastMessage;
   final DateTime? lastMessageTime;
   final bool isTemporary;
+  final bool isGroup;
+  final List<String> hiddenForUserIds;
+  final Map<String, String> clearedAtByUser;
 
   ChatGroup({
     required this.id,
@@ -60,6 +63,9 @@ class ChatGroup {
     this.lastMessage,
     this.lastMessageTime,
     this.isTemporary = true,
+    this.isGroup = true,
+    this.hiddenForUserIds = const [],
+    this.clearedAtByUser = const {},
   });
 
   int get memberCount => memberIds.length;
@@ -87,6 +93,9 @@ class ChatGroup {
         'lastMessage': lastMessage,
         'lastMessageTime': lastMessageTime?.toIso8601String(),
         'isTemporary': isTemporary,
+        'isGroup': isGroup,
+        'hiddenForUserIds': hiddenForUserIds,
+        'clearedAtByUser': clearedAtByUser,
       };
 
   factory ChatGroup.fromMap(Map<String, dynamic> map) => ChatGroup(
@@ -102,6 +111,13 @@ class ChatGroup {
         lastMessage: map['lastMessage'],
         lastMessageTime: DateFormatter.parseDateNullable(map['lastMessageTime']),
         isTemporary: map['isTemporary'] ?? true,
+          isGroup: map['isGroup'] is bool
+            ? map['isGroup'] as bool
+            : ((map['chatType'] ?? '').toString().toLowerCase() != 'direct'),
+        hiddenForUserIds:
+            List<String>.from(map['hiddenForUserIds'] ?? const []),
+        clearedAtByUser: Map<String, String>.from(
+            (map['clearedAtByUser'] ?? const <String, dynamic>{}) as Map),
       );
 }
 

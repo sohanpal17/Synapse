@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../models/case_model.dart';
 import 'sync_service.dart';
@@ -7,6 +8,8 @@ import 'sync_service.dart';
 /// Handles all Firestore read/write operations
 class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final FirebaseFunctions _functions =
+      FirebaseFunctions.instanceFor(region: 'asia-south1');
 
   String get _currentUid => FirebaseAuth.instance.currentUser?.uid ?? '';
 
@@ -74,6 +77,30 @@ class FirestoreService {
     final assignedTo = (map['assignedToId'] as String? ?? '').trim();
     if (assignedTo.isNotEmpty) {
       participants.add(assignedTo);
+    }
+
+    map['participantIds'] = participants.toList();
+    return map;
+  }
+
+  Map<String, dynamic> _withNoticeParticipants(Map<String, dynamic> data) {
+    final uid = _currentUid;
+    final map = Map<String, dynamic>.from(data);
+    if (uid.isEmpty) return map;
+
+    map['ownerUid'] = (map['ownerUid'] as String? ?? uid).trim().isEmpty
+      ? uid
+      : map['ownerUid'];
+    map['createdBy'] = (map['createdBy'] as String? ?? uid).trim().isEmpty
+      ? uid
+      : map['createdBy'];
+
+    final participants = <String>{uid};
+    participants.addAll(List<String>.from(map['participantIds'] ?? const []));
+
+    final authorId = (map['authorId'] as String? ?? '').trim();
+    if (authorId.isNotEmpty) {
+      participants.add(authorId);
     }
 
     map['participantIds'] = participants.toList();
@@ -204,6 +231,23 @@ class FirestoreService {
     );
   }
 
+  /// Update team members for a case through a callable (bypasses client ACL write limits).
+  Future<void> updateCaseTeamMembers({
+    required String cino,
+    required List<String> memberIds,
+    List<String> lawyerIds = const [],
+    List<String> internIds = const [],
+    List<String> clientIds = const [],
+  }) async {
+    await _functions.httpsCallable('updateCaseTeamMembers').call({
+      'cino': cino,
+      'memberIds': memberIds,
+      'lawyerIds': lawyerIds,
+      'internIds': internIds,
+      'clientIds': clientIds,
+    });
+  }
+
   // ══════════════════════════════════════
   //                TASKS
   // ══════════════════════════════════════
@@ -224,12 +268,21 @@ class FirestoreService {
     final snapshots = await Future.wait([
       _db.collection('tasks').where('participantIds', arrayContains: uid).get(),
       _db.collection('tasks').where('assignedJuniorIds', arrayContains: uid).get(),
+      _db.collection('tasks').where('assignedToIds', arrayContains: uid).get(),
+      _db.collection('tasks').where('assignedToId', isEqualTo: uid).get(),
+      _db.collection('tasks').where('createdBy', isEqualTo: uid).get(),
       _db.collection('tasks').where('isPublic', isEqualTo: true).get(),
     ]);
 
     return _mergeByDocumentId(
-      [...snapshots[0].docs, ...snapshots[1].docs],
-      snapshots[2].docs,
+      [
+        ...snapshots[0].docs,
+        ...snapshots[1].docs,
+        ...snapshots[2].docs,
+        ...snapshots[3].docs,
+        ...snapshots[4].docs,
+      ],
+      snapshots[5].docs,
     );
   }
 
@@ -246,6 +299,18 @@ class FirestoreService {
         .collection('tasks')
         .where('assignedJuniorIds', arrayContains: uid)
         .snapshots();
+    final assignedManyStream = _db
+      .collection('tasks')
+      .where('assignedToIds', arrayContains: uid)
+      .snapshots();
+    final assignedSingleStream = _db
+      .collection('tasks')
+      .where('assignedToId', isEqualTo: uid)
+      .snapshots();
+    final createdByStream = _db
+      .collection('tasks')
+      .where('createdBy', isEqualTo: uid)
+      .snapshots();
     final publicStream = _db
         .collection('tasks')
         .where('isPublic', isEqualTo: true)
@@ -254,11 +319,20 @@ class FirestoreService {
     final controller = StreamController<List<Map<String, dynamic>>>();
     List<QueryDocumentSnapshot<Map<String, dynamic>>> participantDocs = const [];
     List<QueryDocumentSnapshot<Map<String, dynamic>>> assignedDocs = const [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> assignedManyDocs = const [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> assignedSingleDocs = const [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> createdByDocs = const [];
     List<QueryDocumentSnapshot<Map<String, dynamic>>> publicDocs = const [];
 
     void emitMerged() {
       controller.add(_mergeByDocumentId(
-        [...participantDocs, ...assignedDocs],
+        [
+          ...participantDocs,
+          ...assignedDocs,
+          ...assignedManyDocs,
+          ...assignedSingleDocs,
+          ...createdByDocs,
+        ],
         publicDocs,
       ));
     }
@@ -277,7 +351,28 @@ class FirestoreService {
       },
       onError: controller.addError,
     );
-    final subC = publicStream.listen(
+    final subC = assignedManyStream.listen(
+      (snapshot) {
+        assignedManyDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+    final subD = assignedSingleStream.listen(
+      (snapshot) {
+        assignedSingleDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+    final subE = createdByStream.listen(
+      (snapshot) {
+        createdByDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+    final subF = publicStream.listen(
       (snapshot) {
         publicDocs = snapshot.docs;
         emitMerged();
@@ -289,6 +384,9 @@ class FirestoreService {
       await subA.cancel();
       await subB.cancel();
       await subC.cancel();
+      await subD.cancel();
+      await subE.cancel();
+      await subF.cancel();
     };
 
     return controller.stream;
@@ -297,6 +395,30 @@ class FirestoreService {
   /// Delete a task
   Future<void> deleteTask(String taskId) async {
     await _db.collection('tasks').doc(taskId).delete();
+  }
+
+  /// Delete task via callable (creator/admin enforced on backend)
+  Future<void> deleteTaskSecure(String taskId) async {
+    await _functions.httpsCallable('deleteTask').call({
+      'taskId': taskId,
+    });
+  }
+
+  /// Update task status via callable (server-side ACL)
+  Future<void> updateTaskStatus(String taskId, String status) async {
+    await _functions.httpsCallable('updateTaskStatus').call({
+      'taskId': taskId,
+      'status': status,
+    });
+  }
+
+  /// Update task details via callable (creator/admin enforced on backend)
+  Future<void> updateTaskDetails(
+      String taskId, Map<String, dynamic> updates) async {
+    await _functions.httpsCallable('updateTaskDetails').call({
+      'taskId': taskId,
+      'updates': updates,
+    });
   }
 
   // ══════════════════════════════════════
@@ -389,37 +511,121 @@ class FirestoreService {
     return controller.stream;
   }
 
+  /// Delete assignment via callable (creator/admin enforced on backend)
+  Future<void> deleteAssignmentSecure(String assignmentId) async {
+    await _functions.httpsCallable('deleteAssignment').call({
+      'assignmentId': assignmentId,
+    });
+  }
+
+  /// Update assignment status via callable (server-side ACL)
+  Future<void> updateAssignmentStatus(String assignmentId, String status) async {
+    await _functions.httpsCallable('updateAssignmentStatus').call({
+      'assignmentId': assignmentId,
+      'status': status,
+    });
+  }
+
+  /// Update assignment details via callable (creator/admin enforced on backend)
+  Future<void> updateAssignmentDetails(
+      String assignmentId, Map<String, dynamic> updates) async {
+    await _functions.httpsCallable('updateAssignmentDetails').call({
+      'assignmentId': assignmentId,
+      'updates': updates,
+    });
+  }
+
   // ══════════════════════════════════════
   //              NOTICES
   // ══════════════════════════════════════
 
   /// Create a notice
   Future<void> createNotice(Map<String, dynamic> notice) async {
-    await _db.collection('notices').doc(notice['id']).set(notice);
+    final map = _withNoticeParticipants(notice);
+    await _db.collection('notices').doc(notice['id']).set(map);
+  }
+
+  /// Create/update notice via callable (server-side ACL + participant expansion)
+  Future<void> upsertNoticeSecure(Map<String, dynamic> notice) async {
+    await _functions.httpsCallable('upsertNotice').call({
+      'notice': notice,
+    });
   }
 
   /// Get all notices for the firm
   Future<List<Map<String, dynamic>>> getNotices() async {
-    final snapshot = await _db
-        .collection('notices')
-        .orderBy('createdAt', descending: true)
-        .get();
+    final uid = _currentUid;
+    if (uid.isEmpty) return [];
 
-    return snapshot.docs.map((doc) => doc.data()).toList();
+    final snapshots = await Future.wait([
+      _db
+          .collection('notices')
+          .where('participantIds', arrayContains: uid)
+          .get(),
+      _db
+          .collection('notices')
+          .where('authorId', isEqualTo: uid)
+          .get(),
+    ]);
+
+    return _mergeByDocumentId(snapshots[0].docs, snapshots[1].docs);
   }
 
   /// Real-time stream of notices
   Stream<List<Map<String, dynamic>>> watchNotices() {
-    return _db
+    final uid = _currentUid;
+    if (uid.isEmpty) return Stream.value(const []);
+
+    final participantStream = _db
         .collection('notices')
-        .orderBy('createdAt', descending: true)
-        .snapshots()
-        .map((s) => s.docs.map((d) => d.data()).toList());
+        .where('participantIds', arrayContains: uid)
+        .snapshots();
+    final authorStream = _db
+        .collection('notices')
+        .where('authorId', isEqualTo: uid)
+        .snapshots();
+
+    final controller = StreamController<List<Map<String, dynamic>>>();
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> participantDocs = const [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> authorDocs = const [];
+
+    void emitMerged() {
+      controller.add(_mergeByDocumentId(participantDocs, authorDocs));
+    }
+
+    final subA = participantStream.listen(
+      (snapshot) {
+        participantDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+    final subB = authorStream.listen(
+      (snapshot) {
+        authorDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+
+    controller.onCancel = () async {
+      await subA.cancel();
+      await subB.cancel();
+    };
+
+    return controller.stream;
   }
 
   /// Delete a notice
   Future<void> deleteNotice(String noticeId) async {
     await _db.collection('notices').doc(noticeId).delete();
+  }
+
+  /// Delete notice via callable (author/admin enforced on backend)
+  Future<void> deleteNoticeSecure(String noticeId) async {
+    await _functions.httpsCallable('deleteNotice').call({
+      'noticeId': noticeId,
+    });
   }
 
   // ══════════════════════════════════════
@@ -428,7 +634,24 @@ class FirestoreService {
 
   /// Create a chat group
   Future<void> createChatGroup(Map<String, dynamic> group) async {
-    await _db.collection('chatGroups').doc(group['id']).set(group);
+    final uid = _currentUid;
+    if (uid.isEmpty) return;
+
+    final map = Map<String, dynamic>.from(group);
+    final members = <String>{
+      uid,
+      (map['createdBy'] ?? '').toString(),
+      ...List<String>.from(map['memberIds'] ?? const []),
+      ...List<String>.from(map['participantIds'] ?? const []),
+    }..removeWhere((e) => e.trim().isEmpty);
+
+    map['createdBy'] = (map['createdBy'] ?? '').toString().trim().isEmpty
+        ? uid
+        : map['createdBy'];
+    map['memberIds'] = members.toList();
+    map['participantIds'] = members.toList();
+
+    await _db.collection('chatGroups').doc(map['id']).set(map);
   }
 
   /// Get all chat groups for the firm
@@ -437,9 +660,13 @@ class FirestoreService {
     if (uid.isEmpty) return Stream.value(const []);
     return _db
         .collection('chatGroups')
-      .where('memberIds', arrayContains: uid)
+        .where('memberIds', arrayContains: uid)
         .snapshots()
-        .map((s) => s.docs.map((d) => d.data()).toList());
+        .map((s) => s.docs
+            .map((d) => d.data())
+            .where((m) => !List<String>.from(m['hiddenForUserIds'] ?? const [])
+                .contains(uid))
+            .toList());
   }
 
   /// Delete a chat group
@@ -459,6 +686,34 @@ class FirestoreService {
     await batch.commit();
   }
 
+  /// Create/update chat group via callable with creator-only update enforcement.
+  Future<void> upsertChatGroupSecure(Map<String, dynamic> group) async {
+    await _functions.httpsCallable('upsertChatGroup').call({
+      'group': group,
+    });
+  }
+
+  /// Hide chat group only for current user.
+  Future<void> deleteChatForMeSecure(String groupId) async {
+    await _functions.httpsCallable('deleteChatForMe').call({
+      'groupId': groupId,
+    });
+  }
+
+  /// Delete chat for everyone (creator only).
+  Future<void> deleteChatForEveryoneSecure(String groupId) async {
+    await _functions.httpsCallable('deleteChatForEveryone').call({
+      'groupId': groupId,
+    });
+  }
+
+  /// Clear chat history only for current user.
+  Future<void> clearChatForMeSecure(String groupId) async {
+    await _functions.httpsCallable('clearChatForMe').call({
+      'groupId': groupId,
+    });
+  }
+
   // ══════════════════════════════════════
   //              MESSAGES
   // ══════════════════════════════════════
@@ -467,7 +722,8 @@ class FirestoreService {
   Future<void> sendMessage(Map<String, dynamic> message) async {
     final uid = _currentUid;
     if (uid.isEmpty) return;
-    final groupId = message['chatGroupId'];
+    final map = Map<String, dynamic>.from(message);
+    final groupId = map['chatGroupId'];
     final groupRef = _db.collection('chatGroups').doc(groupId);
     final groupDoc = await groupRef.get();
     if (!groupDoc.exists) return;
@@ -477,16 +733,30 @@ class FirestoreService {
       throw StateError('You are not allowed to send messages to this chat.');
     }
 
-    // Save message in subcollection
-    await groupRef
-        .collection('messages')
-        .doc(message['id'])
-        .set(message);
+    final messageRef = groupRef.collection('messages').doc(map['id']);
+    final clientTs = map['timestamp'];
 
-    // Update the group's last message preview
-    await groupRef.update({
-      'lastMessage': message['content'],
-      'lastMessageTime': message['timestamp'],
+    await _db.runTransaction((txn) async {
+      final groupSnap = await txn.get(groupRef);
+      if (!groupSnap.exists) {
+        throw StateError('Chat group no longer exists.');
+      }
+
+      final latestMembers =
+          List<String>.from(groupSnap.data()?['memberIds'] ?? const []);
+      if (!latestMembers.contains(uid)) {
+        throw StateError('You are not allowed to send messages to this chat.');
+      }
+
+      map['senderId'] = uid;
+      map['clientTimestamp'] = clientTs;
+      map['timestamp'] = FieldValue.serverTimestamp();
+
+      txn.set(messageRef, map);
+      txn.update(groupRef, {
+        'lastMessage': map['content'],
+        'lastMessageTime': FieldValue.serverTimestamp(),
+      });
     });
   }
 
@@ -507,21 +777,34 @@ class FirestoreService {
 
   /// Send an SOS alert
   Future<void> sendSOS(Map<String, dynamic> sos) async {
-    await _db.collection('sos_alerts').doc(sos['id']).set(sos);
+    final map = Map<String, dynamic>.from(sos);
+    final participants = <String>{
+      (map['sentBy'] ?? '').toString(),
+      ...List<String>.from(map['participantIds'] ?? const []),
+      ...List<String>.from(map['recipientIds'] ?? const []),
+    }..removeWhere((e) => e.trim().isEmpty);
+    map['participantIds'] = participants.toList();
+
+    await _db.collection('sos_alerts').doc(map['id']).set(map);
   }
 
   /// Get SOS alerts for a user (recipient)
   Stream<List<Map<String, dynamic>>> watchSOSAlerts(String userId) {
     return _db
         .collection('sos_alerts')
-        .where('recipientIds', arrayContains: userId)
+        .where('participantIds', arrayContains: userId)
         .limit(20)
         .snapshots()
         .map((s) {
           final items = s.docs.map((d) => d.data()).toList();
           DateTime parseTs(Map<String, dynamic> m) {
-            final raw = (m['timestamp'] ?? '').toString();
-            return DateTime.tryParse(raw) ?? DateTime.fromMillisecondsSinceEpoch(0);
+            final raw = m['timestamp'] ?? m['createdAt'];
+            if (raw is Timestamp) return raw.toDate();
+            if (raw is DateTime) return raw;
+            if (raw is String) {
+              return DateTime.tryParse(raw) ?? DateTime.fromMillisecondsSinceEpoch(0);
+            }
+            return DateTime.fromMillisecondsSinceEpoch(0);
           }
 
           items.sort((a, b) => parseTs(b).compareTo(parseTs(a)));
@@ -535,27 +818,76 @@ class FirestoreService {
 
   /// Save a reminder
   Future<void> upsertReminder(Map<String, dynamic> reminder) async {
+    final map = Map<String, dynamic>.from(reminder);
+    final participants = <String>{
+      (map['createdBy'] ?? '').toString(),
+      ...List<String>.from(map['participantIds'] ?? const []),
+      ...List<String>.from(map['sharedWithUserIds'] ?? const []),
+    }..removeWhere((e) => e.trim().isEmpty);
+    map['participantIds'] = participants.toList();
+
     await _db
         .collection('reminders')
-        .doc(reminder['id'])
-        .set(reminder, SetOptions(merge: true));
+        .doc(map['id'])
+        .set(map, SetOptions(merge: true));
   }
 
   /// Get reminders for the firm
   Future<List<Map<String, dynamic>>> getReminders() async {
-    final snapshot = await _db
-        .collection('reminders')
-        .get();
+    final uid = _currentUid;
+    if (uid.isEmpty) return [];
 
-    return snapshot.docs.map((doc) => doc.data()).toList();
+    final snapshots = await Future.wait([
+      _db.collection('reminders').where('participantIds', arrayContains: uid).get(),
+      _db.collection('reminders').where('createdBy', isEqualTo: uid).get(),
+    ]);
+
+    return _mergeByDocumentId(snapshots[0].docs, snapshots[1].docs);
   }
 
   /// Real-time stream of reminders
   Stream<List<Map<String, dynamic>>> watchReminders() {
-    return _db
+    final uid = _currentUid;
+    if (uid.isEmpty) return Stream.value(const []);
+
+    final participantStream = _db
         .collection('reminders')
-        .snapshots()
-        .map((s) => s.docs.map((d) => d.data()).toList());
+        .where('participantIds', arrayContains: uid)
+        .snapshots();
+    final createdByStream = _db
+        .collection('reminders')
+        .where('createdBy', isEqualTo: uid)
+        .snapshots();
+
+    final controller = StreamController<List<Map<String, dynamic>>>();
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> participantDocs = const [];
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> createdByDocs = const [];
+
+    void emitMerged() {
+      controller.add(_mergeByDocumentId(participantDocs, createdByDocs));
+    }
+
+    final subA = participantStream.listen(
+      (snapshot) {
+        participantDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+    final subB = createdByStream.listen(
+      (snapshot) {
+        createdByDocs = snapshot.docs;
+        emitMerged();
+      },
+      onError: controller.addError,
+    );
+
+    controller.onCancel = () async {
+      await subA.cancel();
+      await subB.cancel();
+    };
+
+    return controller.stream;
   }
 
   // ══════════════════════════════════════
@@ -565,19 +897,33 @@ class FirestoreService {
 
   /// Set any document (used by sync engine)
   Future<void> setDocument(
-      String collection, String docId, Map<String, dynamic> data) async {
+      String collection, String docId, Map<String, dynamic> data,
+      {String action = 'UPDATE'}) async {
     final uid = _currentUid;
     if (uid.isEmpty) return;
+
+    if (collection == 'notices') {
+      await upsertNoticeSecure({
+        ...data,
+        'id': docId,
+      });
+      return;
+    }
 
     final effectiveDocId = collection == 'cases'
       ? _caseDocIdForUser(uid, docId)
       : docId;
 
-    final effectiveData = collection == 'cases'
-      ? _withCaseParticipants(data)
-      : (collection == 'tasks' || collection == 'assignments' || collection == 'chatGroups'
-        ? _withParticipants(data)
-        : data);
+    final shouldEnrichForCreate = action == 'CREATE';
+    final effectiveData = !shouldEnrichForCreate
+        ? data
+        : collection == 'cases'
+            ? _withCaseParticipants(data)
+        : (collection == 'tasks' || collection == 'assignments' || collection == 'chatGroups'
+                ? _withParticipants(data)
+          : collection == 'notices'
+            ? _withNoticeParticipants(data)
+                : data);
 
     await _db
         .collection(collection)
@@ -589,6 +935,11 @@ class FirestoreService {
   Future<void> deleteDocument(String collection, String docId) async {
     final uid = _currentUid;
     if (uid.isEmpty) return;
+
+    if (collection == 'notices') {
+      await deleteNoticeSecure(docId);
+      return;
+    }
 
     final effectiveDocId = collection == 'cases'
         ? _caseDocIdForUser(uid, docId)

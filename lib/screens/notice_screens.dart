@@ -524,28 +524,39 @@ class NoticeDetailScreen extends ConsumerWidget {
 
   const NoticeDetailScreen({super.key, required this.notice});
 
-  void _deleteNotice(BuildContext context, WidgetRef ref) {
+  Future<void> _deleteNotice(BuildContext context, WidgetRef ref) async {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Delete Notice'),
         content: const Text('Are you sure you want to delete this notice?'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Cancel'),
           ),
           TextButton(
-            onPressed: () {
-              ref.read(noticesProvider.notifier).deleteNotice(notice.id);
-              Navigator.pop(context); // Close dialog
-              Navigator.pop(context); // Close detail screen
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Notice deleted'),
-                  backgroundColor: AppColors.error,
-                ),
-              );
+            onPressed: () async {
+              Navigator.pop(dialogContext); // Close dialog
+              try {
+                await ref.read(noticesProvider.notifier).deleteNotice(notice.id);
+                if (!context.mounted) return;
+                Navigator.pop(context); // Close detail screen
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Notice deleted'),
+                    backgroundColor: AppColors.error,
+                  ),
+                );
+              } catch (_) {
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Unable to delete notice'),
+                    backgroundColor: AppColors.error,
+                  ),
+                );
+              }
             },
             child: const Text('Delete', style: TextStyle(color: AppColors.error)),
           ),

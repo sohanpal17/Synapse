@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/gestures.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:firebase_storage/firebase_storage.dart';
@@ -9,6 +10,7 @@ import '../main.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/card_widgets.dart';
 import '../models/messaging_models.dart';
+import '../models/user_model.dart';
 import '../providers/providers.dart';
 import '../services/firestore_service.dart';
 
@@ -127,7 +129,7 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
                       final chatGroup = visibleChatGroups[index];
                       final user = ref.read(currentUserProvider);
                       String? directMemberRole;
-                      if (chatGroup.memberCount == 2 && user != null) {
+                      if (!chatGroup.isGroup && chatGroup.memberCount == 2 && user != null) {
                         final otherId = chatGroup.memberIds
                             .firstWhere((id) => id != user.uid, orElse: () => '');
                         if (otherId.isNotEmpty) {
@@ -192,6 +194,16 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
   final _nameController = TextEditingController();
   final Set<String> _selectedMemberIds = {};
   bool _isGroupChat = true; // true for Group, false for Direct
+  String _recipientRoleFilter = 'all';
+
+  String _normalizeRole(String role) {
+    return role.trim().toLowerCase();
+  }
+
+  bool _matchesRoleFilter(UserModel member) {
+    if (_recipientRoleFilter == 'all') return true;
+    return _normalizeRole(member.role) == _recipientRoleFilter;
+  }
 
   @override
   void dispose() {
@@ -279,6 +291,7 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
       createdBy: user.uid,
       createdByName: user.name,
       createdAt: DateTime.now(),
+      isGroup: _isGroupChat,
     );
 
     ref.read(chatGroupsProvider.notifier).addChatGroup(chatGroup);
@@ -301,6 +314,11 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
   Widget build(BuildContext context) {
     final membersAsync = ref.watch(firmMembersProvider);
     final teamMembers = membersAsync.valueOrNull ?? [];
+    final filteredMembers = teamMembers.where(_matchesRoleFilter).toList();
+    final selectedInCurrentFilter =
+      filteredMembers.where((m) => _selectedMemberIds.contains(m.uid)).length;
+    final allCurrentFilterSelected =
+      filteredMembers.isNotEmpty && selectedInCurrentFilter == filteredMembers.length;
 
     return Scaffold(
       body: Column(
@@ -510,16 +528,31 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
                   ),
                   const SizedBox(height: 12),
 
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _buildRoleFilterChip('all', 'All'),
+                      _buildRoleFilterChip('lawyer', 'Lawyers'),
+                      _buildRoleFilterChip('intern', 'Interns'),
+                      _buildRoleFilterChip('client', 'Clients'),
+                    ],
+                  ),
+
+                  const SizedBox(height: 12),
+
                   // Select All Checkbox (only for group chats)
                   if (_isGroupChat)
                     GestureDetector(
                       onTap: () {
                         setState(() {
-                          if (_selectedMemberIds.length == teamMembers.length) {
-                            _selectedMemberIds.clear();
+                          if (allCurrentFilterSelected) {
+                            for (final m in filteredMembers) {
+                              _selectedMemberIds.remove(m.uid);
+                            }
                           } else {
                             _selectedMemberIds
-                                .addAll(teamMembers.map((m) => m.uid));
+                                .addAll(filteredMembers.map((m) => m.uid));
                           }
                         });
                       },
@@ -529,15 +562,16 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
                           child: Row(
                             children: [
                               Checkbox(
-                                value: _selectedMemberIds.length ==
-                                    teamMembers.length,
+                                value: allCurrentFilterSelected,
                                 onChanged: (value) {
                                   setState(() {
                                     if (value == true) {
                                       _selectedMemberIds.addAll(
-                                          teamMembers.map((m) => m.uid));
+                                          filteredMembers.map((m) => m.uid));
                                     } else {
-                                      _selectedMemberIds.clear();
+                                      for (final m in filteredMembers) {
+                                        _selectedMemberIds.remove(m.uid);
+                                      }
                                     }
                                   });
                                 },
@@ -552,7 +586,7 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
                               const SizedBox(width: 12),
                               const Expanded(
                                 child: Text(
-                                  'Select All',
+                                  'Select All (Current Tab)',
                                   style: TextStyle(
                                     fontSize: 14,
                                     fontWeight: FontWeight.w600,
@@ -567,7 +601,15 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
                     ),
 
                   // Member List
-                  ...teamMembers.map((member) {
+                  if (filteredMembers.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      child: Text(
+                        'No recipients in this category.',
+                        style: TextStyle(color: Colors.grey[600]),
+                      ),
+                    ),
+                  ...filteredMembers.map((member) {
                     final isSelected = _selectedMemberIds.contains(member.uid);
                     return GestureDetector(
                       onTap: () {
@@ -690,6 +732,29 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
       ),
     );
   }
+
+  Widget _buildRoleFilterChip(String value, String label) {
+    final isSelected = _recipientRoleFilter == value;
+    return ChoiceChip(
+      label: Text(label),
+      selected: isSelected,
+      onSelected: (_) {
+        setState(() {
+          _recipientRoleFilter = value;
+        });
+      },
+      selectedColor: AppColors.primary,
+      labelStyle: TextStyle(
+        color: isSelected ? AppColors.white : AppColors.primary,
+        fontWeight: FontWeight.w600,
+      ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+        side: const BorderSide(color: AppColors.primary),
+      ),
+      backgroundColor: AppColors.white,
+    );
+  }
 }
 
 // ==================== CHAT CONVERSATION SCREEN ====================
@@ -711,6 +776,10 @@ class _ChatConversationScreenState
   String? _selectedAttachmentType;
   String? _selectedAttachmentName;
   bool _uploadingAttachment = false;
+  static final RegExp _urlRegex = RegExp(
+    r'((https?:\/\/|www\.)[^\s]+)',
+    caseSensitive: false,
+  );
 
   String _formatRoleLabel(String role) {
     if (role.isEmpty) return 'Member';
@@ -733,6 +802,61 @@ class _ChatConversationScreenState
         const SnackBar(content: Text('Could not open attachment.')),
       );
     }
+  }
+
+  Future<void> _openMessageLink(String rawUrl) async {
+    final normalized = rawUrl.startsWith('http://') || rawUrl.startsWith('https://')
+        ? rawUrl
+        : 'https://$rawUrl';
+    final uri = Uri.tryParse(normalized);
+    if (uri == null) return;
+    final opened = await launchUrl(uri, mode: LaunchMode.platformDefault);
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open link.')),
+      );
+    }
+  }
+
+  List<InlineSpan> _buildMessageSpans(String text, bool isOwnMessage) {
+    final spans = <InlineSpan>[];
+    int cursor = 0;
+
+    final baseColor = isOwnMessage ? AppColors.white : AppColors.text;
+    final linkColor = isOwnMessage ? const Color(0xFFE3F2FD) : AppColors.primary;
+
+    for (final match in _urlRegex.allMatches(text)) {
+      if (match.start > cursor) {
+        spans.add(TextSpan(text: text.substring(cursor, match.start)));
+      }
+
+      final urlText = text.substring(match.start, match.end);
+      spans.add(
+        TextSpan(
+          text: urlText,
+          style: TextStyle(
+            color: linkColor,
+            decoration: TextDecoration.underline,
+            fontWeight: FontWeight.w600,
+          ),
+          recognizer: TapGestureRecognizer()
+            ..onTap = () {
+              _openMessageLink(urlText);
+            },
+        ),
+      );
+      cursor = match.end;
+    }
+
+    if (cursor < text.length) {
+      spans.add(TextSpan(text: text.substring(cursor)));
+    }
+
+    if (spans.isEmpty) {
+      spans.add(TextSpan(text: text, style: TextStyle(color: baseColor)));
+    }
+
+    return spans;
   }
 
   @override
@@ -917,65 +1041,106 @@ class _ChatConversationScreenState
     }
   }
 
-  void _deleteChat() {
-    final user = ref.read(currentUserProvider);
-    if (user == null || user.uid != widget.chatGroup.createdBy) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only the group creator can delete chat.')),
-      );
-      return;
-    }
+  Future<void> _deleteChatForMe(ChatGroup chatGroup) async {
+    await ref.read(chatGroupsProvider.notifier).deleteChatForMe(chatGroup.id);
+    if (!mounted) return;
+    Navigator.pop(context);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Chat deleted for you')),
+    );
+  }
 
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Chat'),
-        content:
-            Text('Are you sure you want to delete "${widget.chatGroup.name}"?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              ref
-                  .read(chatGroupsProvider.notifier)
-                  .deleteChatGroup(widget.chatGroup.id);
-              Navigator.pop(context); // Close dialog
-              Navigator.pop(context); // Close chat screen
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Chat deleted'),
-                  backgroundColor: AppColors.error,
-                ),
-              );
-            },
-            child:
-                const Text('Delete', style: TextStyle(color: AppColors.error)),
-          ),
-        ],
+  Future<void> _deleteChatForEveryone(ChatGroup chatGroup) async {
+    await ref
+        .read(chatGroupsProvider.notifier)
+        .deleteChatForEveryone(chatGroup.id);
+    if (!mounted) return;
+    Navigator.pop(context);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Chat deleted for everyone'),
+        backgroundColor: AppColors.error,
       ),
     );
   }
 
-  Future<void> _showEditGroupNameDialog(ChatGroup chatGroup) async {
+  Future<void> _clearChatForMe(ChatGroup chatGroup) async {
+    await ref.read(chatGroupsProvider.notifier).clearChatForMe(chatGroup.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Chat cleared for you')),
+    );
+  }
+
+  Future<void> _showDeleteOptions(ChatGroup chatGroup, bool isOwner) async {
+    final selection = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Chat'),
+        content: Text(isOwner
+            ? 'Choose how to delete "${chatGroup.name}".'
+            : 'Delete this chat only for you?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'me'),
+            child: const Text('Delete for me'),
+          ),
+          if (isOwner)
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'everyone'),
+              child: const Text(
+                'Delete for everyone',
+                style: TextStyle(color: AppColors.error),
+              ),
+            ),
+        ],
+      ),
+    );
+
+    if (selection == 'me') {
+      await _deleteChatForMe(chatGroup);
+    } else if (selection == 'everyone') {
+      await _deleteChatForEveryone(chatGroup);
+    }
+  }
+
+  Future<void> _showEditGroupDetailsDialog(ChatGroup chatGroup) async {
     final user = ref.read(currentUserProvider);
     if (user == null || user.uid != chatGroup.createdBy) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only the group creator can edit group name.')),
+        const SnackBar(
+            content: Text(
+                'Only the group creator can edit group name and description.')),
       );
       return;
     }
 
-    final controller = TextEditingController(text: chatGroup.name);
+    final nameController = TextEditingController(text: chatGroup.name);
+    final descriptionController =
+        TextEditingController(text: chatGroup.description ?? '');
     final shouldSave = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Edit Group Name'),
-        content: TextField(
-          controller: controller,
-          decoration: const InputDecoration(hintText: 'Enter group name'),
+        title: const Text('Edit Group Details'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameController,
+              decoration: const InputDecoration(hintText: 'Enter group name'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: descriptionController,
+              decoration:
+                  const InputDecoration(hintText: 'Enter group description'),
+              maxLines: 3,
+            ),
+          ],
         ),
         actions: [
           TextButton(
@@ -991,7 +1156,8 @@ class _ChatConversationScreenState
     );
 
     if (shouldSave != true) return;
-    final updatedName = controller.text.trim();
+    final updatedName = nameController.text.trim();
+    final updatedDescription = descriptionController.text.trim();
     if (updatedName.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Group name cannot be empty')),
@@ -1003,7 +1169,7 @@ class _ChatConversationScreenState
       id: chatGroup.id,
       caseId: chatGroup.caseId,
       name: updatedName,
-      description: chatGroup.description,
+      description: updatedDescription.isEmpty ? null : updatedDescription,
       createdBy: chatGroup.createdBy,
       createdByName: chatGroup.createdByName,
       createdAt: chatGroup.createdAt,
@@ -1012,20 +1178,26 @@ class _ChatConversationScreenState
       lastMessage: chatGroup.lastMessage,
       lastMessageTime: chatGroup.lastMessageTime,
       isTemporary: chatGroup.isTemporary,
+      isGroup: chatGroup.isGroup,
+      hiddenForUserIds: chatGroup.hiddenForUserIds,
+      clearedAtByUser: chatGroup.clearedAtByUser,
     );
 
     await ref.read(chatGroupsProvider.notifier).updateChatGroup(updated);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Group name updated')),
+      const SnackBar(content: Text('Group details updated')),
     );
   }
 
   Future<void> _showManageMembersDialog(ChatGroup chatGroup) async {
     final user = ref.read(currentUserProvider);
-    if (user == null || user.uid != chatGroup.createdBy) {
+    final isCreator = user?.uid == chatGroup.createdBy;
+    if (user == null || !isCreator) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only the group creator can manage members.')),
+        const SnackBar(
+            content:
+                Text('Only the group creator can add or remove members.')),
       );
       return;
     }
@@ -1106,6 +1278,9 @@ class _ChatConversationScreenState
       lastMessage: chatGroup.lastMessage,
       lastMessageTime: chatGroup.lastMessageTime,
       isTemporary: chatGroup.isTemporary,
+      isGroup: chatGroup.isGroup,
+      hiddenForUserIds: chatGroup.hiddenForUserIds,
+      clearedAtByUser: chatGroup.clearedAtByUser,
     );
 
     await ref.read(chatGroupsProvider.notifier).updateChatGroup(updated);
@@ -1125,6 +1300,7 @@ class _ChatConversationScreenState
         : widget.chatGroup;
     final members = ref.watch(firmMembersProvider).valueOrNull ?? const [];
     final isOwner = currentUserId.isNotEmpty && currentUserId == chatGroup.createdBy;
+    final canManageMembers = isOwner;
 
     String displayName = chatGroup.name;
     String directRoleLabel = '';
@@ -1200,16 +1376,16 @@ class _ChatConversationScreenState
                         ),
                         if (chatGroup.memberCount > 2 && isOwner)
                           const PopupMenuItem(
-                            value: 'edit_name',
+                            value: 'edit_details',
                             child: Row(
                               children: [
                                 Icon(Icons.edit, size: 20),
                                 SizedBox(width: 12),
-                                Text('Edit Group Name'),
+                                Text('Edit Group Details'),
                               ],
                             ),
                           ),
-                        if (chatGroup.memberCount > 2 && isOwner)
+                        if (chatGroup.memberCount > 2 && canManageMembers)
                           const PopupMenuItem(
                             value: 'manage_members',
                             child: Row(
@@ -1220,6 +1396,16 @@ class _ChatConversationScreenState
                               ],
                             ),
                           ),
+                        const PopupMenuItem(
+                          value: 'clear_for_me',
+                          child: Row(
+                            children: [
+                              Icon(Icons.cleaning_services, size: 20),
+                              SizedBox(width: 12),
+                              Text('Clear Chat for Me'),
+                            ],
+                          ),
+                        ),
                         const PopupMenuItem(
                           value: 'delete',
                           child: Row(
@@ -1235,13 +1421,15 @@ class _ChatConversationScreenState
                       ],
                       onSelected: (value) {
                         if (value == 'delete') {
-                          _deleteChat();
+                          _showDeleteOptions(chatGroup, isOwner);
                         } else if (value == 'members') {
                           _showMembersDialog(chatGroup);
-                        } else if (value == 'edit_name') {
-                          _showEditGroupNameDialog(chatGroup);
+                        } else if (value == 'edit_details') {
+                          _showEditGroupDetailsDialog(chatGroup);
                         } else if (value == 'manage_members') {
                           _showManageMembersDialog(chatGroup);
+                        } else if (value == 'clear_for_me') {
+                          _clearChatForMe(chatGroup);
                         }
                       },
                     ),
@@ -1261,8 +1449,12 @@ class _ChatConversationScreenState
                   return const Center(child: CircularProgressIndicator());
                 }
                 final rawMessages = snapshot.data ?? [];
-                final messages =
-                    rawMessages.map((m) => ChatMessage.fromMap(m)).toList();
+                final clearIso = chatGroup.clearedAtByUser[currentUserId];
+                final clearAt = DateTime.tryParse(clearIso ?? '');
+                final messages = rawMessages
+                  .map((m) => ChatMessage.fromMap(m))
+                  .where((m) => clearAt == null || !m.timestamp.isBefore(clearAt))
+                  .toList();
 
                 if (messages.isEmpty) {
                   return Center(
@@ -1390,13 +1582,20 @@ class _ChatConversationScreenState
                                     ),
                                   ],
                                   if (message.content.isNotEmpty)
-                                    Text(
-                                      message.content,
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        color: isOwnMessage
-                                            ? AppColors.white
-                                            : AppColors.text,
+                                    SelectionArea(
+                                      child: Text.rich(
+                                        TextSpan(
+                                          style: TextStyle(
+                                            fontSize: 14,
+                                            color: isOwnMessage
+                                                ? AppColors.white
+                                                : AppColors.text,
+                                          ),
+                                          children: _buildMessageSpans(
+                                            message.content,
+                                            isOwnMessage,
+                                          ),
+                                        ),
                                       ),
                                     ),
                                   const SizedBox(height: 4),

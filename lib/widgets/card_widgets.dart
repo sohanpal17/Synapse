@@ -157,7 +157,7 @@ class ChatGroupCard extends StatelessWidget {
   });
 
   String get _displayName {
-    if (chatGroup.memberCount == 2 && currentUserId != null) {
+    if (!chatGroup.isGroup && chatGroup.memberCount == 2 && currentUserId != null) {
       final otherIndex = chatGroup.memberIds.indexWhere((id) => id != currentUserId);
       if (otherIndex != -1 && otherIndex < chatGroup.memberNames.length) {
         return chatGroup.memberNames[otherIndex].replaceAll(' (You)', '');
@@ -169,7 +169,7 @@ class ChatGroupCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final displayName = _displayName;
-    final isDirect = chatGroup.memberCount == 2;
+    final isDirect = !chatGroup.isGroup;
     
     return Container(
       margin: const EdgeInsets.only(bottom: 12),

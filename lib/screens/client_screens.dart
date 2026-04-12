@@ -10,6 +10,7 @@ import '../models/case_model.dart';
 import '../models/reminder_models.dart';
 import '../models/task_models.dart';
 import '../models/notice_models.dart';
+import '../utils/date_formatter.dart';
 
 // ==================== CLIENT DASHBOARD ====================
 class ClientDashboard extends ConsumerStatefulWidget {
@@ -19,13 +20,56 @@ class ClientDashboard extends ConsumerStatefulWidget {
   ConsumerState<ClientDashboard> createState() => _ClientDashboardState();
 }
 
-class _ClientDashboardState extends ConsumerState<ClientDashboard> {
+class _ClientDashboardState extends ConsumerState<ClientDashboard> with WidgetsBindingObserver {
   int _currentNavIndex = 0;
   final Set<String> _seenSosAlertIds = <String>{};
   bool _showSosBlink = false;
   bool _blinkOn = false;
   Timer? _blinkTicker;
   Timer? _blinkStopper;
+  StreamSubscription<Map<String, dynamic>>? _sosBlinkSub;
+
+  // ══════════ SINGLE UNIFIED SOS HANDLER ══════════
+
+  void _handleSos({
+    required String sosId,
+    required String sentBy,
+    String senderName = 'Team member',
+    String caseName = 'Unknown case',
+    String courtRoom = '',
+    bool isRecent = true,
+  }) {
+    if (sosId.isEmpty) return;
+    if (_seenSosAlertIds.contains(sosId)) return;
+    if (!isRecent) return;
+
+    // Defer processing if app is not in the foreground.
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    final isForeground = lifecycleState == AppLifecycleState.resumed || lifecycleState == null;
+    if (!isForeground) return;
+
+    _seenSosAlertIds.add(sosId);
+
+    final user = ref.read(currentUserProvider);
+    final currentUid = user?.uid ?? '';
+    if (sentBy.isNotEmpty && sentBy == currentUid) return;
+    if (_showSosBlink) return;
+
+    _triggerSosBlink();
+    NotificationService.playSosNotificationAudioFor3Seconds();
+    NotificationService.markSosBlinkConsumed(sosId);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('SOS received from $senderName ($caseName)'),
+          backgroundColor: AppColors.error,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+  }
 
   void _triggerSosBlink() {
     _blinkTicker?.cancel();
@@ -58,42 +102,19 @@ class _ClientDashboardState extends ConsumerState<ClientDashboard> {
     alertsAsync.whenData((alerts) {
       for (final alert in alerts) {
         final id = (alert['id'] ?? '').toString();
-        if (id.isEmpty || _seenSosAlertIds.contains(id)) continue;
-
-        final timestampRaw = (alert['timestamp'] ?? '').toString();
-        final sentAt = DateTime.tryParse(timestampRaw);
+        final sentAt = DateFormatter.parseDateNullable(
+          alert['timestamp'] ?? alert['createdAt'],
+        );
         final isRecent = sentAt != null &&
             DateTime.now().difference(sentAt) <= const Duration(minutes: 2);
 
-        _seenSosAlertIds.add(id);
-
-        if (NotificationService.shouldSuppressSosVisual(sosId: id)) {
-          continue;
-        }
-
-        // Ignore stale SOS alerts to avoid confusion when opening app much later.
-        if (!isRecent) continue;
-
-        if ((alert['sentBy'] ?? '').toString() == currentUid) continue;
-
-        _triggerSosBlink();
-
-        if (mounted) {
-          final senderName =
-              (alert['sentByName'] ?? 'Team member').toString();
-          final caseName = (alert['caseName'] ?? 'Unknown case').toString();
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('SOS received from $senderName ($caseName)'),
-              backgroundColor: AppColors.error,
-            ),
-          );
-        }
-
-        NotificationService.showSOSAlert(
+        _handleSos(
+          sosId: id,
+          sentBy: (alert['sentBy'] ?? '').toString(),
           senderName: (alert['sentByName'] ?? 'Team member').toString(),
           caseName: (alert['caseName'] ?? 'Unknown case').toString(),
-          courtRoom: (alert['courtRoom'] ?? 'Unknown courtroom').toString(),
+          courtRoom: (alert['courtRoom'] ?? '').toString(),
+          isRecent: isRecent,
         );
       }
     });
@@ -101,24 +122,105 @@ class _ClientDashboardState extends ConsumerState<ClientDashboard> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _blinkTicker?.cancel();
     _blinkStopper?.cancel();
+    _sosBlinkSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      final user = ref.read(currentUserProvider);
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final memoryBlinks = NotificationService.consumePendingSosBlinks();
+        for (final blink in memoryBlinks) {
+          _handleSos(
+            sosId: (blink['sosId'] ?? '').toString(),
+            sentBy: (blink['sentBy'] ?? '').toString(),
+            senderName: (blink['sentByName'] ?? 'Team member').toString(),
+            caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+            courtRoom: (blink['courtRoom'] ?? '').toString(),
+          );
+        }
+
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+
+    _sosBlinkSub = NotificationService.sosBlinkStream.listen((data) {
+      _handleSos(
+        sosId: (data['sosId'] ?? '').toString(),
+        sentBy: (data['sentBy'] ?? '').toString(),
+        senderName: (data['sentByName'] ?? 'Team member').toString(),
+        caseName: (data['caseName'] ?? 'Unknown case').toString(),
+        courtRoom: (data['courtRoom'] ?? '').toString(),
+      );
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final memoryBlinks = NotificationService.consumePendingSosBlinks();
+      for (final blink in memoryBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      final hiveBlinks = NotificationService.loadPendingSosBlinksFromHive();
+      for (final blink in hiveBlinks) {
+        _handleSos(
+          sosId: (blink['sosId'] ?? '').toString(),
+          sentBy: (blink['sentBy'] ?? '').toString(),
+          senderName: (blink['sentByName'] ?? 'Team member').toString(),
+          caseName: (blink['caseName'] ?? 'Unknown case').toString(),
+          courtRoom: (blink['courtRoom'] ?? '').toString(),
+        );
+      }
+
+      final user = ref.read(currentUserProvider);
+      final uid = user?.uid ?? '';
+      if (uid.isNotEmpty) {
+        final currentAlerts = ref.read(sosAlertsProvider);
+        _processSosAlerts(currentAlerts, uid);
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final user = ref.watch(currentUserProvider);
-    final sosAlerts = ref.watch(sosAlertsProvider);
+    ref.watch(sosAlertsProvider);
     final uid = user?.uid ?? '';
-    if (uid.isNotEmpty) {
-      _processSosAlerts(sosAlerts, uid);
-    }
+    ref.listen<AsyncValue<List<Map<String, dynamic>>>>(
+      sosAlertsProvider,
+      (previous, next) {
+        if (uid.isNotEmpty) {
+          _processSosAlerts(next, uid);
+        }
+      },
+    );
 
     final allCases = ref.watch(casesProvider);
-    final myCases = allCases.where((c) => c.clientIds.contains(user?.uid) && !c.isClosed).toList();
-    myCases.sort((a, b) => (a.nextHearingDate ?? DateTime(2099)).compareTo(b.nextHearingDate ?? DateTime(2099)));
-    final activeCase = myCases.isNotEmpty ? myCases.first : null;
+    final myCases = allCases
+      .where((c) => c.clientIds.contains(user?.uid) && !c.isClosed)
+      .toList();
+    myCases.sort(
+      (a, b) => (a.nextHearingDate ?? DateTime(2099))
+        .compareTo(b.nextHearingDate ?? DateTime(2099)),
+    );
 
     return Scaffold(
       body: Stack(
@@ -175,84 +277,116 @@ class _ClientDashboardState extends ConsumerState<ClientDashboard> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  if (activeCase != null)
-                    Container(
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        gradient: const LinearGradient(
-                          colors: [AppColors.primary, AppColors.secondary],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppColors.primary.withOpacity(0.3),
-                            blurRadius: 15,
-                            offset: const Offset(0, 8),
+                  const Text(
+                    'Active Cases',
+                    style: TextStyle(
+                      color: AppColors.primary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  if (myCases.isNotEmpty)
+                    ...myCases.map(
+                      (activeCase) => Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: GestureDetector(
+                          onTap: () => Navigator.pushNamed(
+                            context,
+                            '/case-progress',
+                            arguments: activeCase,
                           ),
-                        ],
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                          child: Container(
+                            padding: const EdgeInsets.all(20),
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [AppColors.primary, AppColors.secondary],
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                              ),
+                              borderRadius: BorderRadius.circular(16),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: AppColors.primary.withOpacity(0.3),
+                                  blurRadius: 15,
+                                  offset: const Offset(0, 8),
+                                ),
+                              ],
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                   children: [
-                                    Text('Your Active Case', style: TextStyle(color: AppColors.white.withOpacity(0.6), fontSize: 12)),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      activeCase.title,
-                                      style: const TextStyle(color: AppColors.white, fontSize: 18, fontWeight: FontWeight.w600),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
+                                    Expanded(
+                                      child: Text(
+                                        activeCase.title,
+                                        style: const TextStyle(
+                                          color: AppColors.white,
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 6,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: AppColors.accent,
+                                        borderRadius: BorderRadius.circular(16),
+                                      ),
+                                      child: Text(
+                                        activeCase.statusText,
+                                        style: const TextStyle(
+                                          color: AppColors.primary,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
                                     ),
                                   ],
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                              Container(
-                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                                decoration: BoxDecoration(
-                                  color: AppColors.accent,
-                                  borderRadius: BorderRadius.circular(16),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    const Icon(
+                                      Icons.calendar_today,
+                                      size: 14,
+                                      color: AppColors.white,
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Expanded(
+                                      child: Text(
+                                        activeCase.nextHearingDate != null
+                                            ? 'Next hearing: ${DateFormat('MMM dd, yyyy').format(activeCase.nextHearingDate!)}'
+                                            : 'Next hearing: TBD',
+                                        style: TextStyle(
+                                          color: AppColors.white.withOpacity(0.85),
+                                          fontSize: 12,
+                                        ),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                child: Text(
-                                  activeCase.statusText,
-                                  style: const TextStyle(color: AppColors.primary, fontSize: 12, fontWeight: FontWeight.w600),
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              const Icon(Icons.calendar_today, size: 14, color: AppColors.white),
-                              const SizedBox(width: 6),
-                              Expanded(
-                                child: Text(
-                                  activeCase.nextHearingDate != null
-                                      ? 'Next hearing: ${DateFormat('MMM dd, yyyy').format(activeCase.nextHearingDate!)}'
-                                      : 'Next hearing: TBD',
-                                  style: TextStyle(color: AppColors.white.withOpacity(0.85), fontSize: 12),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
+                        ),
                       ),
-                    ),
-                  if (activeCase == null)
+                    )
+                  else
                     const AppCard(
                       child: Padding(
                         padding: EdgeInsets.all(20),
-                        child: Text('No active cases assigned yet.'),
+                        child: Text('You have no active cases.'),
                       ),
                     ),
                 ],
@@ -279,14 +413,12 @@ class _ClientDashboardState extends ConsumerState<ClientDashboard> {
         items: const [
           BottomNavItem(icon: Icons.home, label: 'Home'),
           BottomNavItem(icon: Icons.folder, label: 'Cases'),
-          BottomNavItem(icon: Icons.description, label: 'Docs'),
           BottomNavItem(icon: Icons.message_outlined, label: 'Messages'),
         ],
         onTap: (index) {
           setState(() => _currentNavIndex = index);
           if (index == 1) Navigator.pushNamed(context, '/client-cases');
-          if (index == 2) Navigator.pushNamed(context, '/client-documents');
-          if (index == 3) Navigator.pushNamed(context, '/messages');
+          if (index == 2) Navigator.pushNamed(context, '/messages');
         },
       ),
     );
@@ -312,7 +444,20 @@ class ClientCasesScreen extends ConsumerWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('My Cases', style: TextStyle(color: AppColors.white, fontSize: 18, fontWeight: FontWeight.w600)),
+                Row(
+                  children: [
+                    _buildBackButton(context),
+                    const SizedBox(width: 12),
+                    const Text(
+                      'My Cases',
+                      style: TextStyle(
+                        color: AppColors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 16),
                 const SearchField(hint: 'Search cases...'),
               ],
@@ -459,26 +604,6 @@ class CaseProgressScreen extends StatelessWidget {
                         _buildTimelineItem(c.isClosed, 'Final Judgment', c.decisionDate != null ? DateFormat('MMM dd, yyyy').format(c.decisionDate!) : 'Pending', c.disposalStatus, false, isLast: true),
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 20),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: () => Navigator.pushNamed(context, '/client-documents'),
-                          style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary, foregroundColor: AppColors.white),
-                          child: const Text('Documents'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: () => Navigator.pushNamed(context, '/client-calendar'),
-                          style: ElevatedButton.styleFrom(backgroundColor: AppColors.white, foregroundColor: AppColors.primary),
-                          child: const Text('Important Dates'),
-                        ),
-                      ),
-                    ],
                   ),
                 ],
               ),

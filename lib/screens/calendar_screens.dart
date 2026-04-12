@@ -346,10 +346,6 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.initialMemberIds != null && widget.initialMemberIds!.isNotEmpty) {
-      _visibility = ReminderVisibility.specificUsers;
-      _selectedUserIds = Set<String>.from(widget.initialMemberIds!);
-    }
   }
 
   @override
@@ -448,20 +444,7 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
         return;
       }
 
-      final allRoleSelected = roleMemberIds.isNotEmpty &&
-          roleMemberIds.every(finalSelectedUserIds.contains);
-
-      if (!allRoleSelected) {
-        finalVisibility = ReminderVisibility.specificUsers;
-      }
-    }
-
-    if (finalVisibility == ReminderVisibility.specificUsers &&
-        finalSelectedUserIds.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select at least one member.')),
-      );
-      return;
+      finalSelectedUserIds = roleMemberIds.toSet();
     }
 
     // Combine date and time
@@ -671,7 +654,6 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                           ReminderVisibility.private,
                           ReminderVisibility.lawyers,
                           ReminderVisibility.interns,
-                          ReminderVisibility.specificUsers,
                         ].map((visibility) {
                           return DropdownMenuItem(
                             value: visibility,
@@ -694,8 +676,7 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                         onChanged: (value) {
                           setState(() {
                             _visibility = value!;
-                            if (_visibility != ReminderVisibility.specificUsers &&
-                                _visibility != ReminderVisibility.lawyers &&
+                            if (_visibility != ReminderVisibility.lawyers &&
                                 _visibility != ReminderVisibility.interns) {
                               _selectedUserIds.clear();
                               _selectAll = false;
@@ -723,37 +704,34 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                       builder: (context) {
                         final membersAsync = ref.watch(firmMembersProvider);
                         return membersAsync.when(
-                          loading: () => const Center(child: CircularProgressIndicator()),
+                          loading: () => const Center(
+                            child: CircularProgressIndicator(),
+                          ),
                           error: (_, __) => const Text('Could not load members'),
                           data: (members) {
-                            final targetRole = _visibility == ReminderVisibility.lawyers
-                                ? 'lawyer'
-                                : 'intern';
+                            final targetRole =
+                                _visibility == ReminderVisibility.lawyers
+                                    ? 'lawyer'
+                                    : 'intern';
                             final roleMembers = members
                                 .where((m) => m.role == targetRole)
                                 .toList();
-
-                            final allSelected = roleMembers.isNotEmpty &&
-                                roleMembers.every((m) => _selectedUserIds.contains(m.uid));
-
-                            if (_selectedUserIds.isEmpty && roleMembers.isNotEmpty) {
-                              WidgetsBinding.instance.addPostFrameCallback((_) {
-                                if (!mounted) return;
-                                setState(() {
-                                  _selectedUserIds = roleMembers.map((m) => m.uid).toSet();
-                                  _selectAll = true;
-                                });
-                              });
-                            }
 
                             if (roleMembers.isEmpty) {
                               return Text(
                                 _visibility == ReminderVisibility.lawyers
                                     ? 'No lawyers found.'
                                     : 'No interns found.',
-                                style: const TextStyle(color: Colors.grey, fontSize: 13),
+                                style: const TextStyle(
+                                  color: Colors.grey,
+                                  fontSize: 13,
+                                ),
                               );
                             }
+
+                            final allSelected = roleMembers.isNotEmpty &&
+                                roleMembers
+                                    .every((m) => _selectedUserIds.contains(m.uid));
 
                             return Column(
                               crossAxisAlignment: CrossAxisAlignment.start,
@@ -783,13 +761,15 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                       ),
                                     ),
                                     activeColor: AppColors.primary,
-                                    controlAffinity: ListTileControlAffinity.leading,
+                                    controlAffinity:
+                                        ListTileControlAffinity.leading,
                                     contentPadding: EdgeInsets.zero,
                                   ),
                                 ),
                                 const SizedBox(height: 8),
                                 ...roleMembers.map((member) {
-                                  final isSelected = _selectedUserIds.contains(member.uid);
+                                  final isSelected =
+                                      _selectedUserIds.contains(member.uid);
                                   return Padding(
                                     padding: const EdgeInsets.only(bottom: 8),
                                     child: GestureDetector(
@@ -801,7 +781,9 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                             _selectedUserIds.add(member.uid);
                                           }
                                           _selectAll = roleMembers.isNotEmpty &&
-                                              roleMembers.every((m) => _selectedUserIds.contains(m.uid));
+                                              roleMembers.every((m) =>
+                                                  _selectedUserIds
+                                                      .contains(m.uid));
                                         });
                                       },
                                       child: AppCard(
@@ -812,12 +794,18 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                               onChanged: (value) {
                                                 setState(() {
                                                   if (value == true) {
-                                                    _selectedUserIds.add(member.uid);
+                                                    _selectedUserIds
+                                                        .add(member.uid);
                                                   } else {
-                                                    _selectedUserIds.remove(member.uid);
+                                                    _selectedUserIds
+                                                        .remove(member.uid);
                                                   }
-                                                  _selectAll = roleMembers.isNotEmpty &&
-                                                      roleMembers.every((m) => _selectedUserIds.contains(m.uid));
+                                                  _selectAll =
+                                                      roleMembers.isNotEmpty &&
+                                                          roleMembers.every((m) =>
+                                                              _selectedUserIds
+                                                                  .contains(
+                                                                      m.uid));
                                                 });
                                               },
                                               activeColor: AppColors.primary,
@@ -825,10 +813,13 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                             const SizedBox(width: 12),
                                             AvatarCircle(
                                               initials: member.name.isNotEmpty
-                                                  ? member.name.substring(0, 1).toUpperCase()
+                                                  ? member.name
+                                                      .substring(0, 1)
+                                                      .toUpperCase()
                                                   : '?',
                                               size: 36,
-                                              backgroundColor: AppColors.primary,
+                                              backgroundColor:
+                                                  AppColors.primary,
                                             ),
                                             const SizedBox(width: 12),
                                             Expanded(
@@ -839,139 +830,6 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                                   fontWeight: FontWeight.w600,
                                                   color: AppColors.text,
                                                 ),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
-                                  );
-                                }),
-                              ],
-                            );
-                          },
-                        );
-                      },
-                    ),
-                  ],
-                  if (_visibility == ReminderVisibility.specificUsers) ...[
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Select Members',
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: AppColors.primary,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Builder(
-                      builder: (context) {
-                        final membersAsync = ref.watch(firmMembersProvider);
-                        return membersAsync.when(
-                          loading: () => const Center(child: CircularProgressIndicator()),
-                          error: (_, __) => const Text('Could not load members'),
-                          data: (members) {
-                            final selectableMembers = members
-                                .where((m) => m.role == 'lawyer' || m.role == 'intern')
-                                .toList();
-
-                            final allSelected = selectableMembers.isNotEmpty &&
-                                selectableMembers.every((m) => _selectedUserIds.contains(m.uid));
-
-                            return Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                AppCard(
-                                  child: CheckboxListTile(
-                                    value: allSelected,
-                                    onChanged: (value) {
-                                      setState(() {
-                                        _selectAll = value ?? false;
-                                        if (_selectAll) {
-                                          _selectedUserIds = selectableMembers.map((m) => m.uid).toSet();
-                                        } else {
-                                          _selectedUserIds.clear();
-                                        }
-                                      });
-                                    },
-                                    title: const Text(
-                                      'Select All Lawyers & Interns',
-                                      style: TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.w600,
-                                        color: AppColors.primary,
-                                      ),
-                                    ),
-                                    activeColor: AppColors.primary,
-                                    controlAffinity: ListTileControlAffinity.leading,
-                                    contentPadding: EdgeInsets.zero,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                ...selectableMembers.map((member) {
-                                  final isSelected = _selectedUserIds.contains(member.uid);
-                                  return Padding(
-                                    padding: const EdgeInsets.only(bottom: 8),
-                                    child: GestureDetector(
-                                      onTap: () {
-                                        setState(() {
-                                          if (isSelected) {
-                                            _selectedUserIds.remove(member.uid);
-                                          } else {
-                                            _selectedUserIds.add(member.uid);
-                                          }
-                                          _selectAll = selectableMembers.isNotEmpty &&
-                                              selectableMembers.every((m) => _selectedUserIds.contains(m.uid));
-                                        });
-                                      },
-                                      child: AppCard(
-                                        child: Row(
-                                          children: [
-                                            Checkbox(
-                                              value: isSelected,
-                                              onChanged: (value) {
-                                                setState(() {
-                                                  if (value == true) {
-                                                    _selectedUserIds.add(member.uid);
-                                                  } else {
-                                                    _selectedUserIds.remove(member.uid);
-                                                  }
-                                                  _selectAll = selectableMembers.isNotEmpty &&
-                                                      selectableMembers.every((m) => _selectedUserIds.contains(m.uid));
-                                                });
-                                              },
-                                              activeColor: AppColors.primary,
-                                            ),
-                                            const SizedBox(width: 12),
-                                            AvatarCircle(
-                                              initials: member.name.isNotEmpty
-                                                  ? member.name.substring(0, 1).toUpperCase()
-                                                  : '?',
-                                              size: 36,
-                                              backgroundColor: AppColors.primary,
-                                            ),
-                                            const SizedBox(width: 12),
-                                            Expanded(
-                                              child: Column(
-                                                crossAxisAlignment: CrossAxisAlignment.start,
-                                                children: [
-                                                  Text(
-                                                    member.name,
-                                                    style: const TextStyle(
-                                                      fontSize: 14,
-                                                      fontWeight: FontWeight.w600,
-                                                      color: AppColors.text,
-                                                    ),
-                                                  ),
-                                                  Text(
-                                                    member.role,
-                                                    style: TextStyle(
-                                                      fontSize: 12,
-                                                      color: Colors.grey[600],
-                                                    ),
-                                                  ),
-                                                ],
                                               ),
                                             ),
                                           ],
@@ -1085,12 +943,27 @@ class _ReminderDetailScreenState extends ConsumerState<ReminderDetailScreen> {
 
     if (confirmed != true) return;
 
-    await ref.read(remindersProvider.notifier).deleteReminder(_activeReminder.id);
-    if (!mounted) return;
-    Navigator.pop(context);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Reminder deleted')),
-    );
+    try {
+      await ref.read(remindersProvider.notifier).deleteReminder(_activeReminder.id);
+      if (!mounted) return;
+      Navigator.pop(context);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Reminder deleted')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      final message = e.toString().replaceFirst('Exception: ', '').trim();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            message.isEmpty
+                ? 'Reminder can only be deleted by the creator of this reminder'
+                : message,
+          ),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
   }
 
   Future<void> _editReminder() async {
@@ -1210,6 +1083,7 @@ class _ReminderDetailScreenState extends ConsumerState<ReminderDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final urgencyColor = _isCompleted ? Colors.grey : _activeReminder.getUrgencyColor();
+    final members = ref.watch(firmMembersProvider).valueOrNull ?? const [];
 
     return Scaffold(
       body: Column(
@@ -1376,6 +1250,8 @@ class _ReminderDetailScreenState extends ConsumerState<ReminderDetailScreen> {
                         const Divider(height: 24),
                         _buildDetailRow('Created By', _activeReminder.createdByName),
                         const Divider(height: 24),
+                        _buildDetailRow('For Whom', _buildForWhomText(members)),
+                        const Divider(height: 24),
                         _buildDetailRow(
                           'Created On',
                           '${_activeReminder.createdAt.day}/${_activeReminder.createdAt.month}/${_activeReminder.createdAt.year}',
@@ -1423,6 +1299,33 @@ class _ReminderDetailScreenState extends ConsumerState<ReminderDetailScreen> {
         ),
       ],
     );
+  }
+
+  String _buildForWhomText(List<dynamic> members) {
+    switch (_activeReminder.visibility) {
+      case ReminderVisibility.private:
+        return 'Only Me';
+      case ReminderVisibility.lawyers:
+        return 'All Lawyers';
+      case ReminderVisibility.interns:
+        return 'All Interns';
+      case ReminderVisibility.everyone:
+        return 'Everyone';
+      case ReminderVisibility.specificUsers:
+        final targetIds = _activeReminder.sharedWithUserIds.toSet();
+        final names = members
+            .where((m) => targetIds.contains(m.uid))
+            .map<String>((m) => (m.name as String?)?.trim() ?? '')
+            .where((name) => name.isNotEmpty)
+            .toList();
+        if (names.isNotEmpty) {
+          return names.join(', ');
+        }
+        if (targetIds.isNotEmpty) {
+          return '${targetIds.length} selected member(s)';
+        }
+        return 'Selected Members';
+    }
   }
 }
 

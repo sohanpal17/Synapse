@@ -28,6 +28,13 @@ class SOSService {
     String? message,
   }) async {
     final sosId = _uuid.v4();
+    final normalizedRecipients = recipientIds
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toSet()
+        .toList();
+    final participants = <String>{sentById, ...normalizedRecipients}.toList();
+
     final sosData = {
       'id': sosId,
       'caseId': caseId,
@@ -36,7 +43,8 @@ class SOSService {
       'courtComplex': courtComplex,
       'sentBy': sentById,
       'sentByName': sentByName,
-      'recipientIds': recipientIds,
+      'recipientIds': normalizedRecipients,
+      'participantIds': participants,
       'type': 'sos',
       'pushRequested': true,
       'message': message ?? 'Urgent help needed!',
@@ -47,15 +55,20 @@ class SOSService {
     // Save locally always
     await HiveService.put(HiveService.sosBox, sosId, sosData);
 
-    // ── Layer 1: Try online (Firestore → triggers FCM) ──
+    // ── Layer 1: Try online (Firestore → triggers FCM) with retry ──
     final connectivity = await Connectivity().checkConnectivity();
     if (connectivity != ConnectivityResult.none) {
-      try {
-        await FirestoreService().sendSOS(sosData);
-        debugPrint('SOS sent online via Firestore');
-        return 'sent_online';
-      } catch (e) {
-        debugPrint('Online SOS failed: $e');
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await FirestoreService().sendSOS(sosData);
+          debugPrint('SOS sent online via Firestore (attempt $attempt)');
+          return 'sent_online';
+        } catch (e) {
+          debugPrint('Online SOS attempt $attempt failed: $e');
+          if (attempt < 3) {
+            await Future<void>.delayed(Duration(milliseconds: 500 * attempt));
+          }
+        }
       }
     }
 

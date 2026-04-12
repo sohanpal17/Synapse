@@ -13,6 +13,41 @@ const _uuid = Uuid();
 class SyncService {
   final FirestoreService _firestore = FirestoreService();
 
+  dynamic _sanitizeForHive(dynamic value) {
+    if (value is Timestamp) {
+      return value.toDate().toIso8601String();
+    }
+    if (value is Map) {
+      return value.map((key, val) => MapEntry(key, _sanitizeForHive(val)));
+    }
+    if (value is List) {
+      return value.map(_sanitizeForHive).toList();
+    }
+    return value;
+  }
+
+  Map<String, dynamic> _sanitizeMapForHive(Map<String, dynamic> data) {
+    return Map<String, dynamic>.from(_sanitizeForHive(data) as Map);
+  }
+
+  bool _isPermanentSyncError(Object error) {
+    if (error is FirebaseException) {
+      return error.code == 'permission-denied' ||
+          error.code == 'unauthenticated';
+    }
+
+    final text = error.toString().toLowerCase();
+    return text.contains('permission-denied') ||
+        text.contains('missing or insufficient permissions');
+  }
+
+  String _itemLabel(Map<String, dynamic> item) {
+    final action = (item['action'] ?? 'UNKNOWN').toString();
+    final collection = (item['collection'] ?? '').toString();
+    final docId = (item['documentId'] ?? '').toString();
+    return '$action $collection/$docId';
+  }
+
   // ══════════ QUEUE AN OFFLINE ACTION ══════════
 
   /// Add any action to the sync queue (called when offline or as safety net)
@@ -44,7 +79,17 @@ class SyncService {
         SyncService()._processSingleItem(item).then((_) {
           HiveService.removeFromSyncQueue(item['id'] as String);
         }).catchError((e) {
-          debugPrint('Immediate sync failed, queued for later: $e');
+          final syncService = SyncService();
+          if (syncService._isPermanentSyncError(e)) {
+            HiveService.removeFromSyncQueue(item['id'] as String);
+            debugPrint(
+              'Immediate sync permanently rejected (${syncService._itemLabel(item)}), dropped from queue: $e',
+            );
+            return;
+          }
+          debugPrint(
+            'Immediate sync failed for ${syncService._itemLabel(item)}, queued for later: $e',
+          );
         });
       }
     }
@@ -66,12 +111,22 @@ class SyncService {
         await _processSingleItem(item);
         await HiveService.removeFromSyncQueue(item['id'] as String);
       } catch (e) {
-        debugPrint('Sync error for ${item['id'] as String}: $e');
+        if (_isPermanentSyncError(e)) {
+          await HiveService.removeFromSyncQueue(item['id'] as String);
+          debugPrint(
+            'Sync permanently rejected (${_itemLabel(item)}), dropped from queue: $e',
+          );
+          continue;
+        }
+
+        debugPrint('Sync error for ${_itemLabel(item)} (${item['id'] as String}): $e');
         final retryCount = (item['retryCount'] ?? 0) + 1;
         if (retryCount >= 5) {
           // Give up after 5 retries
           await HiveService.removeFromSyncQueue(item['id'] as String);
-          debugPrint('Sync item ${item['id'] as String} dropped after 5 retries');
+          debugPrint(
+            'Sync item ${_itemLabel(item)} (${item['id'] as String}) dropped after 5 retries',
+          );
         } else {
           item['retryCount'] = retryCount;
           await HiveService.addToSyncQueue(item);
@@ -90,7 +145,12 @@ class SyncService {
     switch (action) {
       case 'CREATE':
       case 'UPDATE':
-        await _firestore.setDocument(collection, documentId, data);
+        await _firestore.setDocument(
+          collection,
+          documentId,
+          data,
+          action: action,
+        );
         break;
       case 'DELETE':
         await _firestore.deleteDocument(collection, documentId);
@@ -124,26 +184,54 @@ class SyncService {
         db.collection('assignments').where('participantIds', arrayContains: uid).get(),
         db.collection('assignments').where('assignedToIds', arrayContains: uid).get(),
         db.collection('assignments').where('assignedToId', isEqualTo: uid).get(),
-        db.collection('notices').get(),
+        db.collection('notices').where('participantIds', arrayContains: uid).get(),
+        db.collection('notices').where('authorId', isEqualTo: uid).get(),
+        db.collection('reminders').where('participantIds', arrayContains: uid).get(),
         db.collection('reminders').where('createdBy', isEqualTo: uid).get(),
         db.collection('chatGroups').where('memberIds', arrayContains: uid).get(),
       ]);
 
       for (final doc in futures[0].docs) {
-        final data = doc.data();
+        final data = _sanitizeMapForHive(doc.data());
         final cino = (data['cino'] as String? ?? '').trim();
         final key = cino.isNotEmpty ? cino : doc.id;
         await HiveService.put(HiveService.casesBox, key, data);
       }
       for (final doc in [...futures[1].docs, ...futures[2].docs, ...futures[3].docs]) {
-        await HiveService.put(HiveService.tasksBox, doc.id, doc.data());
+        await HiveService.put(
+          HiveService.tasksBox,
+          doc.id,
+          _sanitizeMapForHive(doc.data()),
+        );
       }
       for (final doc in [...futures[4].docs, ...futures[5].docs, ...futures[6].docs]) {
-        await HiveService.put(HiveService.assignmentsBox, doc.id, doc.data());
+        await HiveService.put(
+          HiveService.assignmentsBox,
+          doc.id,
+          _sanitizeMapForHive(doc.data()),
+        );
       }
-      for (final doc in futures[7].docs) await HiveService.put(HiveService.noticesBox, doc.id, doc.data());
-      for (final doc in futures[8].docs) await HiveService.put(HiveService.remindersBox, doc.id, doc.data());
-      for (final doc in futures[9].docs) await HiveService.put(HiveService.chatGroupsBox, doc.id, doc.data());
+      for (final doc in [...futures[7].docs, ...futures[8].docs]) {
+        await HiveService.put(
+          HiveService.noticesBox,
+          doc.id,
+          _sanitizeMapForHive(doc.data()),
+        );
+      }
+      for (final doc in [...futures[9].docs, ...futures[10].docs]) {
+        await HiveService.put(
+          HiveService.remindersBox,
+          doc.id,
+          _sanitizeMapForHive(doc.data()),
+        );
+      }
+      for (final doc in futures[11].docs) {
+        await HiveService.put(
+          HiveService.chatGroupsBox,
+          doc.id,
+          _sanitizeMapForHive(doc.data()),
+        );
+      }
 
       // Also process any pending uploads
       await processQueue();

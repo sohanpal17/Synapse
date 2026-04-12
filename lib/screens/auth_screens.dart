@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_auth_platform_interface/firebase_auth_platform_interface.dart';
 import '../main.dart';
+import '../config/admin_config.dart';
 import '../providers/providers.dart';
 import '../services/sync_service.dart';
 import '../services/notification_service.dart';
@@ -28,6 +29,10 @@ class AuthGate extends ConsumerWidget {
 
         NotificationService.syncDeviceTokenForUser(user.uid);
 
+        if (!currentUser.isAdmin && (!currentUser.isActive || !currentUser.isApproved)) {
+          return const PendingApprovalScreen();
+        }
+
         switch (currentUser.role) {
           case 'lawyer':
             return const _DashboardLoader(route: '/lawyer-dashboard');
@@ -35,6 +40,8 @@ class AuthGate extends ConsumerWidget {
             return const _DashboardLoader(route: '/intern-dashboard');
           case 'client':
             return const _DashboardLoader(route: '/client-dashboard');
+          case 'admin':
+            return const _DashboardLoader(route: '/lawyer-dashboard');
           default:
             return const LoginScreen();
         }
@@ -231,8 +238,11 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     setState(() => _loading = true);
     try {
       final authService = ref.read(authServiceProvider);
-      final user = await authService.login(
-          emailController.text.trim(), passwordController.text.trim());
+      final email = emailController.text.trim();
+      final password = passwordController.text.trim();
+      final user = email.toLowerCase() == kAdminEmail.toLowerCase()
+        ? await authService.loginAsAdmin(email, password)
+        : await authService.login(email, password);
       if (!mounted) return;
       ref.read(currentUserProvider.notifier).setUser(user);
 
@@ -240,21 +250,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       SyncService().fullSync();
 
       if (!mounted) return;
-      String route;
-      switch (user.role) {
-        case 'lawyer':
-          route = '/lawyer-dashboard';
-          break;
-        case 'intern':
-          route = '/intern-dashboard';
-          break;
-        case 'client':
-          route = '/client-dashboard';
-          break;
-        default:
-          route = '/lawyer-dashboard';
-      }
-      Navigator.pushReplacementNamed(context, route);
+      Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
     } on FirebaseAuthException catch (e) {
       _snack(e.message ?? 'Login failed');
     } catch (e) {
@@ -321,7 +317,8 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                     const SizedBox(height: 12),
                     _field(emailCtrl, 'Email', Icons.email_outlined),
                     const SizedBox(height: 12),
-                    _field(phoneCtrl, 'Phone', Icons.phone_outlined),
+                    _field(phoneCtrl, 'Phone', Icons.phone_outlined,
+                      isPhone: true),
                     const SizedBox(height: 12),
                     _field(passwordCtrl, 'Password', Icons.lock_outline,
                         isPassword: true),
@@ -373,14 +370,23 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   }
 
   Widget _field(TextEditingController ctrl, String hint, IconData icon,
-      {bool isPassword = false}) {
+      {bool isPassword = false, bool isPhone = false}) {
     return TextField(
       controller: ctrl,
       obscureText: isPassword,
+      keyboardType: isPhone ? TextInputType.phone : TextInputType.text,
+      inputFormatters: isPhone
+          ? [
+              FilteringTextInputFormatter.digitsOnly,
+              LengthLimitingTextInputFormatter(10),
+            ]
+          : null,
+      maxLength: isPhone ? 10 : null,
       decoration: InputDecoration(
         hintText: hint,
         prefixIcon: Icon(icon, size: 20),
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        counterText: isPhone ? '' : null,
         contentPadding:
             const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       ),
@@ -394,6 +400,11 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
     }
     if (passwordCtrl.text != confirmPasswordCtrl.text) {
       _snack('Passwords do not match');
+      return;
+    }
+    final normalizedPhone = phoneCtrl.text.replaceAll(RegExp(r'\D'), '');
+    if (normalizedPhone.length != 10) {
+      _snack('Phone number must be exactly 10 digits');
       return;
     }
     setState(() => _loading = true);
@@ -433,16 +444,15 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
          }
       }
 
-      ref.read(currentUserProvider.notifier).setUser(user);
-
       if (!mounted) return;
-      // Navigate to appropriate dashboard
-        final route = user.role == 'client'
-          ? '/client-dashboard'
-          : user.role == 'intern'
-              ? '/intern-dashboard'
-              : '/lawyer-dashboard';
-      Navigator.pushReplacementNamed(context, route);
+      ref.read(currentUserProvider.notifier).setUser(user);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Signup request submitted. Please wait for admin approval.'),
+          backgroundColor: AppColors.warning,
+        ),
+      );
+      Navigator.pushNamedAndRemoveUntil(context, '/', (_) => false);
     } catch (e) {
       if (mounted) setState(() => _loading = false);
       _snack('Registration failed: $e');
@@ -474,4 +484,56 @@ class _LegalPatternPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class PendingApprovalScreen extends ConsumerWidget {
+  const PendingApprovalScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return Scaffold(
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.hourglass_top, size: 56, color: AppColors.warning),
+              const SizedBox(height: 16),
+              const Text(
+                'Approval Pending',
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                  color: AppColors.primary,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Your account is waiting for admin approval. Please try again later.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.text),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton(
+                onPressed: () async {
+                  final auth = ref.read(authServiceProvider);
+                  final userNotifier = ref.read(currentUserProvider.notifier);
+                  await auth.logout();
+                  userNotifier.clear();
+                  if (!context.mounted) return;
+                  Navigator.pushNamedAndRemoveUntil(
+                    context,
+                    '/login',
+                    (_) => false,
+                  );
+                },
+                child: const Text('Sign Out'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

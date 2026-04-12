@@ -34,6 +34,15 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
   String? _selectedCaseId;
   final Set<String> _selectedMemberIds = <String>{};
 
+  @override
+  void initState() {
+    super.initState();
+    // Start fetching members as soon as screen is created.
+    Future<void>.microtask(() {
+      ref.read(firmMembersProvider);
+    });
+  }
+
   void _initFromArgs(List<CaseModel> activeCases) {
     if (_didInitArgs) return;
     _didInitArgs = true;
@@ -146,7 +155,11 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
       if (context.mounted) {
         Navigator.pop(context); // Return to previous screen
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(successMessage), backgroundColor: AppColors.error),
+          SnackBar(
+            content: Text(successMessage),
+            backgroundColor: AppColors.error,
+            duration: const Duration(seconds: 3),
+          ),
         );
       }
     } catch (e) {
@@ -168,6 +181,8 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
     final activeCases = cases.where((c) => !c.isClosed).toList();
     final currentUser = ref.watch(currentUserProvider);
     final membersAsync = ref.watch(firmMembersProvider);
+    final cachedMembers = ref.watch(cachedFirmMembersProvider);
+    final resolvedMembers = membersAsync.valueOrNull ?? cachedMembers;
 
     _initFromArgs(activeCases);
 
@@ -185,15 +200,11 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
     final caseLabel = effectiveCase == null
         ? 'No case selected'
         : '${effectiveCase.title} (${effectiveCase.caseNumber})';
-    final recipientPhones = membersAsync.when(
-      data: (members) => members
-          .where((m) => _selectedMemberIds.contains(m.uid))
-          .map((m) => m.phone)
-          .where((p) => p.trim().isNotEmpty)
-          .toList(),
-      loading: () => <String>[],
-      error: (_, __) => <String>[],
-    );
+    final recipientPhones = resolvedMembers
+      .where((m) => _selectedMemberIds.contains(m.uid))
+      .map((m) => m.phone)
+      .where((p) => p.trim().isNotEmpty)
+      .toList();
 
     return Scaffold(
       body: Container(
@@ -450,10 +461,10 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                                 fontWeight: FontWeight.w700,
                               ),
                             ),
-                            membersAsync.when(
-                              data: (members) {
+                            Builder(
+                              builder: (context) {
                                 final visibleMembers = _eligibleRecipients(
-                                  members,
+                                  resolvedMembers,
                                   currentUser?.uid,
                                   effectiveCase,
                                 );
@@ -467,8 +478,7 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                                           setState(() {
                                             if (allSelected) {
                                               for (final m in visibleMembers) {
-                                                _selectedMemberIds
-                                                    .remove(m.uid);
+                                                _selectedMemberIds.remove(m.uid);
                                               }
                                             } else {
                                               for (final m in visibleMembers) {
@@ -477,26 +487,24 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                                             }
                                           });
                                         },
-                                  child: Text(allSelected
-                                      ? 'Deselect all'
-                                      : 'Select all'),
+                                  child: Text(
+                                    allSelected ? 'Deselect all' : 'Select all',
+                                  ),
                                 );
                               },
-                              loading: () => const SizedBox.shrink(),
-                              error: (_, __) => const SizedBox.shrink(),
                             ),
                           ],
                         ),
-                        membersAsync.when(
-                          data: (members) {
+                        Builder(
+                          builder: (context) {
                             final visibleMembers = _eligibleRecipients(
-                              members,
+                              resolvedMembers,
                               currentUser?.uid,
                               effectiveCase,
                             );
 
                             // Keep selection valid for case-specific SOS.
-                            final teamMemberIds = members
+                            final teamMemberIds = resolvedMembers
                               .where((m) =>
                                 m.role == 'lawyer' || m.role == 'intern')
                               .map((m) => m.uid)
@@ -510,6 +518,17 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                                 effectiveCase.assignedMemberIds.toSet();
                               _selectedMemberIds.removeWhere(
                                   (id) => !allowedIds.contains(id));
+                            }
+
+                            if (visibleMembers.isEmpty &&
+                                membersAsync.isLoading &&
+                                cachedMembers.isEmpty) {
+                              return const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 18),
+                                child: Center(
+                                  child: CircularProgressIndicator(),
+                                ),
+                              );
                             }
 
                             if (visibleMembers.isEmpty) {
@@ -596,11 +615,6 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                               }).toList(),
                             );
                           },
-                          loading: () => const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 24),
-                            child: Center(child: CircularProgressIndicator()),
-                          ),
-                          error: (e, _) => Text('Error loading members: $e'),
                         ),
                         const SizedBox(height: 24),
                         SizedBox(

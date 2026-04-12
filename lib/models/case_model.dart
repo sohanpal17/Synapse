@@ -128,6 +128,7 @@ class CaseModel {
         'urgencyLevel': urgencyLevel,
         'assignedLawyerIds': assignedMemberIds, // Keep old keys for backward sync
         'assignedInternIds': [],
+        'assignedMemberIds': assignedMemberIds,
         'clientIds': clientIds,
         'customDocuments': customDocuments,
         'createdAt': createdAt.toIso8601String(),
@@ -159,8 +160,10 @@ class CaseModel {
       isClosed: decDate != null,
       urgencyLevel: computeUrgency(nextDate),
       assignedMemberIds: [
+        ...List<String>.from(map['assignedMemberIds'] ?? []),
         ...List<String>.from(map['assignedLawyerIds'] ?? []),
         ...List<String>.from(map['assignedInternIds'] ?? []),
+        ...List<String>.from(map['clientIds'] ?? []),
       ].toSet().toList(),
       clientIds: List<String>.from(map['clientIds'] ?? []),
       customDocuments: List<Map<String, dynamic>>.from(map['customDocuments'] ?? []),

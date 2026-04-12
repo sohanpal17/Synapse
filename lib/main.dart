@@ -25,6 +25,8 @@ import 'screens/settings_screen.dart';
 import 'screens/synapse_screens.dart';
 import 'screens/ecourts_import_screen.dart';
 import 'screens/shared_calendar_screens.dart';
+import 'screens/admin_screens.dart';
+import 'providers/providers.dart';
 
 // ==================== APP COLORS ====================
 class AppColors {
@@ -153,11 +155,27 @@ void main() async {
 }
 
 // ==================== APP ====================
-class SynapseApp extends StatelessWidget {
+class SynapseApp extends ConsumerWidget {
   const SynapseApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    Route<dynamic> guardedRoute(
+      RouteSettings settings,
+      Widget child, {
+      bool requireAuth = true,
+      Set<String>? allowedRoles,
+    }) {
+      return MaterialPageRoute(
+        settings: settings,
+        builder: (_) => _RouteGuard(
+          requireAuth: requireAuth,
+          allowedRoles: allowedRoles,
+          child: child,
+        ),
+      );
+    }
+
     return MaterialApp(
       title: 'Synapse',
       debugShowCheckedModeBanner: false,
@@ -182,67 +200,237 @@ class SynapseApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const AuthGate(),
-      routes: {
-        // Auth
-        '/login': (_) => const LoginScreen(),
-        '/register': (_) => const RegisterScreen(),
+      initialRoute: '/',
+      onGenerateRoute: (settings) {
+        switch (settings.name) {
+          case '/':
+            return guardedRoute(settings, const AuthGate(), requireAuth: false);
 
-        // Lawyer Routes
-        '/lawyer-dashboard': (_) => const LawyerDashboard(),
-        '/case-list': (_) => const CaseListScreen(),
-        '/case-detail': (_) => const CaseDetailScreen(),
-        '/lawyer-tasks': (_) => const LawyerTasksScreen(),
-        '/lawyer-assignments': (_) => const LawyerAssignmentsScreen(),
-        '/court-calendar': (_) => const CourtCalendarScreen(),
-        '/lawyer-work': (_) => const LawyerWorkScreen(),
+          // Auth
+          case '/login':
+            return guardedRoute(settings, const LoginScreen(), requireAuth: false);
+          case '/register':
+            return guardedRoute(settings, const RegisterScreen(), requireAuth: false);
 
-        // Intern Routes
-        '/intern-dashboard': (_) => const InternDashboard(),
+          // Lawyer routes
+          case '/lawyer-dashboard':
+            return guardedRoute(settings, const LawyerDashboard(), allowedRoles: _lawyerRole);
+          case '/case-list':
+          case '/case-detail':
+          case '/lawyer-tasks':
+          case '/lawyer-assignments':
+          case '/court-calendar':
+          case '/lawyer-work':
+          case '/my-tasks':
+          case '/intern-assignments':
+          case '/intern-tasks':
+          case '/my-cases':
+          case '/personal-calendar':
+          case '/create-reminder':
+          case '/shared-calendar':
+          case '/home-calendar':
+          case '/calendar-event-chat':
+          case '/create-chat':
+          case '/create-notice':
+          case '/courtroom-sos':
+          case '/document-generator':
+          case '/legal-tools':
+          case '/ecourts-import':
+            return guardedRoute(
+              settings,
+              _routeWidget(settings.name!),
+              allowedRoles: _staffRoles,
+            );
 
-        // Unified Workflow Routes (Interns + Lawyers)
-        '/my-tasks': (_) => const LawyerWorkScreen(), // Redirects to Tasks Tab
-        '/intern-assignments': (_) => const LawyerWorkScreen(), // Redirects to Assignments Tab
-        '/intern-tasks': (_) => const LawyerWorkScreen(), 
-        '/my-cases': (_) => const CaseListScreen(), // Unified Cases Tracker
+          // Intern dashboard
+          case '/intern-dashboard':
+            return guardedRoute(settings, const InternDashboard(), allowedRoles: _internRole);
 
-        // Calendar & Reminder Routes
-        '/personal-calendar': (_) => const PersonalCalendarScreen(),
-        '/create-reminder': (_) => const CreateReminderScreen(),
-        '/shared-calendar': (_) => const SharedFirmCalendarScreen(),
-        '/home-calendar': (_) => const SharedFirmCalendarScreen(),
-        '/calendar-event-chat': (_) => const CalendarEventChatScreen(),
+          // Admin dashboard
+          case '/admin-dashboard':
+            return guardedRoute(settings, const AdminDashboardScreen(), allowedRoles: _adminRole);
 
-        // Messenger Routes
-        '/messenger': (_) => const MessengerScreen(),
-        '/messages': (_) => const MessengerScreen(),
-        '/create-chat': (_) => const CreateChatScreen(),
+          // Routes shared by all authenticated roles
+          case '/messenger':
+          case '/messages':
+          case '/notice-board':
+          case '/notices':
+          case '/notifications':
+            return guardedRoute(
+              settings,
+              _routeWidget(settings.name!),
+              allowedRoles: _allRoles,
+            );
 
-        // Notice Board Routes
-        '/notice-board': (_) => const NoticeBoardScreen(),
-        '/notices': (_) => const NoticeBoardScreen(),
-        '/create-notice': (_) => const CreateNoticeScreen(),
+          // Client routes
+          case '/client-dashboard':
+          case '/client-cases':
+          case '/case-progress':
+          case '/client-documents':
+          case '/client-calendar':
+          case '/lawyer-contact':
+            return guardedRoute(
+              settings,
+              _routeWidget(settings.name!),
+              allowedRoles: _clientRole,
+            );
 
-        // Client Routes
-        '/client-dashboard': (_) => const ClientDashboard(),
-        '/client-cases': (_) => const ClientCasesScreen(),
-        '/case-progress': (_) => const CaseProgressScreen(),
-        '/client-documents': (_) => const ClientDocumentsScreen(),
-        '/client-calendar': (_) => const ClientCalendarScreen(),
-        '/lawyer-contact': (_) => const LawyerContactScreen(),
-        '/notifications': (_) => const NotificationsScreen(),
+          // Settings
+          case '/settings-lawyer':
+            return guardedRoute(
+              settings,
+              const SettingsScreen(userRole: 'Lawyer'),
+              allowedRoles: _lawyerRole,
+            );
+          case '/settings-intern':
+            return guardedRoute(
+              settings,
+              const SettingsScreen(userRole: 'Intern'),
+              allowedRoles: _internRole,
+            );
+          case '/settings-client':
+            return guardedRoute(
+              settings,
+              const SettingsScreen(userRole: 'Client'),
+              allowedRoles: _clientRole,
+            );
 
-        // Settings
-        '/settings-lawyer': (_) => const SettingsScreen(userRole: 'Lawyer'),
-        '/settings-intern': (_) => const SettingsScreen(userRole: 'Intern'),
-        '/settings-client': (_) => const SettingsScreen(userRole: 'Client'),
-
-        // Synapse Features
-        '/courtroom-sos': (_) => const CourtroomSOSScreen(),
-        '/document-generator': (_) => const DocumentGeneratorScreen(),
-        '/legal-tools': (_) => const LegalToolsScreen(),
-        '/ecourts-import': (_) => const EcourtsImportScreen(),
+          default:
+            return guardedRoute(settings, const AuthGate(), requireAuth: false);
+        }
       },
+    );
+  }
+}
+
+const Set<String> _allRoles = {'lawyer', 'intern', 'client', 'admin'};
+const Set<String> _staffRoles = {'lawyer', 'intern', 'admin'};
+const Set<String> _lawyerRole = {'lawyer', 'admin'};
+const Set<String> _internRole = {'intern'};
+const Set<String> _clientRole = {'client'};
+const Set<String> _adminRole = {'admin'};
+
+Widget _routeWidget(String routeName) {
+  switch (routeName) {
+    case '/case-list':
+      return const CaseListScreen();
+    case '/case-detail':
+      return const CaseDetailScreen();
+    case '/lawyer-tasks':
+      return const LawyerTasksScreen();
+    case '/lawyer-assignments':
+      return const LawyerAssignmentsScreen();
+    case '/court-calendar':
+      return const CourtCalendarScreen();
+    case '/lawyer-work':
+    case '/my-tasks':
+    case '/intern-assignments':
+    case '/intern-tasks':
+      return const LawyerWorkScreen();
+    case '/my-cases':
+      return const CaseListScreen();
+    case '/personal-calendar':
+      return const PersonalCalendarScreen();
+    case '/create-reminder':
+      return const CreateReminderScreen();
+    case '/shared-calendar':
+    case '/home-calendar':
+      return const SharedFirmCalendarScreen();
+    case '/calendar-event-chat':
+      return const CalendarEventChatScreen();
+    case '/messenger':
+    case '/messages':
+      return const MessengerScreen();
+    case '/create-chat':
+      return const CreateChatScreen();
+    case '/notice-board':
+    case '/notices':
+      return const NoticeBoardScreen();
+    case '/create-notice':
+      return const CreateNoticeScreen();
+    case '/client-dashboard':
+      return const ClientDashboard();
+    case '/client-cases':
+      return const ClientCasesScreen();
+    case '/case-progress':
+      return const CaseProgressScreen();
+    case '/client-documents':
+      return const ClientDocumentsScreen();
+    case '/client-calendar':
+      return const ClientCalendarScreen();
+    case '/lawyer-contact':
+      return const LawyerContactScreen();
+    case '/notifications':
+      return const NotificationsScreen();
+    case '/admin-dashboard':
+      return const AdminDashboardScreen();
+    case '/courtroom-sos':
+      return const CourtroomSOSScreen();
+    case '/document-generator':
+      return const DocumentGeneratorScreen();
+    case '/legal-tools':
+      return const LegalToolsScreen();
+    case '/ecourts-import':
+      return const EcourtsImportScreen();
+    default:
+      return const AuthGate();
+  }
+}
+
+class _RouteGuard extends ConsumerWidget {
+  final bool requireAuth;
+  final Set<String>? allowedRoles;
+  final Widget child;
+
+  const _RouteGuard({
+    required this.requireAuth,
+    required this.allowedRoles,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final authState = ref.watch(authStateProvider);
+    return authState.when(
+      data: (authUser) {
+        if (!requireAuth) {
+          final isAuthScreen = child is LoginScreen || child is RegisterScreen;
+          if (isAuthScreen && authUser != null) {
+            return const AuthGate();
+          }
+          return child;
+        }
+
+        if (authUser == null) {
+          return const LoginScreen();
+        }
+
+        final currentUser = ref.watch(currentUserProvider);
+        if (currentUser == null || currentUser.uid != authUser.uid) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(color: AppColors.accent),
+            ),
+          );
+        }
+
+        if (!currentUser.isAdmin && (!currentUser.isActive || !currentUser.isApproved)) {
+          return const PendingApprovalScreen();
+        }
+
+        final role = currentUser.role.toLowerCase();
+        if (allowedRoles != null && !allowedRoles!.contains(role)) {
+          return const AuthGate();
+        }
+
+        return child;
+      },
+      loading: () => const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(color: AppColors.accent),
+        ),
+      ),
+      error: (_, __) => const LoginScreen(),
     );
   }
 }

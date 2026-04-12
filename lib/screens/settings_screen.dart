@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/providers.dart';
 import '../models/user_model.dart';
@@ -19,7 +20,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   Future<void> _showEditProfileDialog(
       BuildContext context, UserModel user) async {
     final nameController = TextEditingController(text: user.name);
-    final phoneController = TextEditingController(text: user.phone ?? '');
+    final phoneController = TextEditingController(text: user.phone);
     bool isLoading = false;
 
     await showDialog(
@@ -39,8 +40,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   const SizedBox(height: 16),
                   TextField(
                     controller: phoneController,
+                    keyboardType: TextInputType.phone,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(10),
+                    ],
+                    maxLength: 10,
                     decoration: const InputDecoration(
-                        labelText: 'Phone Number (Optional)'),
+                      labelText: 'Phone Number',
+                      counterText: '',
+                    ),
                   ),
                 ],
               ),
@@ -54,15 +63,28 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                 onPressed: isLoading
                     ? null
                     : () async {
-                        if (nameController.text.trim().isEmpty) return;
+                        final trimmedName = nameController.text.trim();
+                        final normalizedPhone =
+                            phoneController.text.replaceAll(RegExp(r'\D'), '');
+                        if (trimmedName.isEmpty) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Name cannot be empty')),
+                          );
+                          return;
+                        }
+                        if (normalizedPhone.length != 10) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text('Phone number must be exactly 10 digits')),
+                          );
+                          return;
+                        }
                         setState(() => isLoading = true);
                         try {
                           await ref.read(authServiceProvider).updateProfile(
                                 uid: user.uid,
-                                name: nameController.text.trim(),
-                                phone: phoneController.text.trim().isNotEmpty
-                                    ? phoneController.text.trim()
-                                    : null,
+                                name: trimmedName,
+                                phone: normalizedPhone,
                               );
                           // Update provider cache synchronously from local Hive
                           final authService = ref.read(authServiceProvider);
@@ -268,14 +290,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                               email: user.email!, password: passwordCtrl.text);
                           await user.reauthenticateWithCredential(cred);
 
-                          // 2. Purge cloud data for this user
-                          final uidToDelete = user.uid;
-
-                          // Delete all user-owned cloud data before deleting auth identity.
-                          await authService.deleteAllUserData(uidToDelete);
-
-                          // Delete Firebase Auth account only after cloud purge succeeds.
-                          await user.delete();
+                          // 2. Purge cloud data + auth identity on backend
+                          await authService.deleteOwnAccount();
 
                           // 3. Capture container before unmounting UI
                           final container = ProviderScope.containerOf(context);
@@ -384,6 +400,22 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                                 ),
                               ),
                               const SizedBox(height: 4),
+                              Text(
+                                user.email,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey[700],
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                user.phone,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey[700],
+                                ),
+                              ),
+                              const SizedBox(height: 4),
                               Container(
                                 padding: const EdgeInsets.symmetric(
                                     horizontal: 10, vertical: 4),
@@ -401,19 +433,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                                 ),
                               ),
                             ],
-                          ),
-                        ),
-                        GestureDetector(
-                          onTap: () => _showEditProfileDialog(context, user),
-                          child: Container(
-                            width: 40,
-                            height: 40,
-                            decoration: BoxDecoration(
-                              color: AppColors.secondary.withOpacity(0.1),
-                              borderRadius: BorderRadius.circular(20),
-                            ),
-                            child: const Icon(Icons.edit,
-                                color: AppColors.secondary, size: 20),
                           ),
                         ),
                       ],
@@ -440,6 +459,19 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     onTap: () => _showChangePasswordDialog(context),
                   ),
                   const SizedBox(height: 24),
+
+                  if (user.isAdmin) ...[
+                    _buildSectionHeader('Admin'),
+                    const SizedBox(height: 12),
+                    _buildSettingsTile(
+                      icon: Icons.admin_panel_settings_outlined,
+                      iconColor: AppColors.primary,
+                      title: 'Admin Panel',
+                      subtitle: 'Manage onboarding requests and users',
+                      onTap: () => Navigator.pushNamed(context, '/admin-dashboard'),
+                    ),
+                    const SizedBox(height: 24),
+                  ],
 
                   // Support Section
                   _buildSectionHeader('Support'),
@@ -586,14 +618,19 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
 
               Navigator.pop(context); // Close dialog
 
-              // 2. Instantly navigate to Login so UI doesn't hang
-              Navigator.pushNamedAndRemoveUntil(
-                context,
-                '/login',
-                (route) => false,
-              );
+              // 2. Clear visible user state immediately to prevent profile flicker.
+              container.read(currentUserProvider.notifier).clear();
 
-              // 3. Perform teardown detached from UI
+              // 3. Route through AuthGate root so post-logout routing is stable.
+              if (context.mounted) {
+                Navigator.pushNamedAndRemoveUntil(
+                  context,
+                  '/',
+                  (route) => false,
+                );
+              }
+
+              // 4. Perform teardown detached from UI
               Future.microtask(() async {
                 await authService.logout();
                 container.invalidate(currentUserProvider);
