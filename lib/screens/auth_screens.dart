@@ -38,8 +38,6 @@ class AuthGate extends ConsumerWidget {
             return const _DashboardLoader(route: '/lawyer-dashboard');
           case 'intern':
             return const _DashboardLoader(route: '/intern-dashboard');
-          case 'client':
-            return const _DashboardLoader(route: '/client-dashboard');
           case 'admin':
             return const _DashboardLoader(route: '/lawyer-dashboard');
           default:
@@ -335,7 +333,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                     const SizedBox(height: 8),
                     Wrap(
                       spacing: 8,
-                      children: ['lawyer', 'intern', 'client']
+                      children: ['lawyer', 'intern']
                           .map((r) => ChoiceChip(
                                 label: Text(r[0].toUpperCase() + r.substring(1)),
                                 selected: role == r,

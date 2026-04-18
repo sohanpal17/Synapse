@@ -74,7 +74,7 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
     }
 
     return availableMembers.where((m) {
-      final isLawyer = m.role == 'lawyer';
+      final isLawyer = m.role == 'lawyer' || m.role == 'admin';
       final isIntern = m.role == 'intern';
       final isTeamMember = isLawyer || isIntern;
       if (!isTeamMember) return false;
@@ -506,7 +506,9 @@ class _CourtroomSOSScreenState extends ConsumerState<CourtroomSOSScreen> {
                             // Keep selection valid for case-specific SOS.
                             final teamMemberIds = resolvedMembers
                               .where((m) =>
-                                m.role == 'lawyer' || m.role == 'intern')
+                                m.role == 'lawyer' ||
+                                m.role == 'admin' ||
+                                m.role == 'intern')
                               .map((m) => m.uid)
                               .toSet();
                             _selectedMemberIds

@@ -52,7 +52,6 @@ class _InternDashboardState extends ConsumerState<InternDashboard> with WidgetsB
     if (_showSosBlink) return;
 
     _triggerSosBlink();
-    NotificationService.playSosNotificationAudioFor3Seconds();
     NotificationService.markSosBlinkConsumed(sosId);
 
     if (mounted) {
@@ -499,25 +498,6 @@ class _InternDashboardState extends ConsumerState<InternDashboard> with WidgetsB
                                     context, '/notice-board'),
                               ),
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: SizedBox(
-                                width: tileWidth,
-                                child: _buildToolButton(
-                                  Icons.description,
-                                  'Doc Generator',
-                                  Colors.purple,
-                                  () => Navigator.pushNamed(
-                                      context, '/document-generator'),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            const Expanded(child: SizedBox.shrink()),
                           ],
                         ),
                       ],

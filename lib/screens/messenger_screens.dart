@@ -25,6 +25,155 @@ class MessengerScreen extends ConsumerStatefulWidget {
 }
 
 class _MessengerScreenState extends ConsumerState<MessengerScreen> {
+  void _openCreateChat({required bool isGroupChat}) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => CreateChatScreen(initialIsGroupChat: isGroupChat),
+      ),
+    ).then((_) => setState(() {}));
+  }
+
+  void _showNewChatOptionsSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: Container(
+            decoration: const BoxDecoration(
+              color: AppColors.white,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[300],
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Start New',
+                    style: TextStyle(
+                      color: AppColors.primary,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _buildNewChatOptionTile(
+                  icon: Icons.group,
+                  title: 'Group Chat',
+                  subtitle: 'Create a chat with multiple members',
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    _openCreateChat(isGroupChat: true);
+                  },
+                ),
+                _buildNewChatOptionTile(
+                  icon: Icons.person,
+                  title: 'Direct Message',
+                  subtitle: 'Start one-to-one conversation',
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    _openCreateChat(isGroupChat: false);
+                  },
+                ),
+                _buildNewChatOptionTile(
+                  icon: Icons.chat_outlined,
+                  title: 'Client (WhatsApp)',
+                  subtitle: 'Send a prefilled WhatsApp message',
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    _showWhatsAppClientSheet();
+                  },
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildNewChatOptionTile({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: AppColors.background,
+        borderRadius: BorderRadius.circular(14),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Container(
+                  width: 36,
+                  height: 36,
+                  decoration: BoxDecoration(
+                    color: AppColors.primary.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(icon, color: AppColors.primary, size: 20),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          color: AppColors.text,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          color: Colors.grey[600],
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const Icon(Icons.chevron_right, color: AppColors.grey),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showWhatsAppClientSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const _ClientWhatsAppSheet(),
+    );
+  }
+
   String _formatRoleLabel(String role) {
     if (role.isEmpty) return 'Member';
     return role[0].toUpperCase() + role.substring(1).toLowerCase();
@@ -161,14 +310,7 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
       ),
       floatingActionButton: canCreateChat
           ? FloatingActionButton.extended(
-              onPressed: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => const CreateChatScreen(),
-                  ),
-                ).then((_) => setState(() {}));
-              },
+              onPressed: _showNewChatOptionsSheet,
               backgroundColor: AppColors.accent,
               icon: const Icon(Icons.add, color: AppColors.primary),
               label: const Text(
@@ -182,9 +324,214 @@ class _MessengerScreenState extends ConsumerState<MessengerScreen> {
   }
 }
 
+Future<bool> launchClientWhatsApp({
+  required String phoneNumber,
+  required String message,
+}) async {
+  final normalizedPhone = phoneNumber.trim();
+  final encodedMessage = Uri.encodeComponent(message.trim());
+
+  final appUri = Uri.parse(
+    'whatsapp://send?phone=$normalizedPhone&text=$encodedMessage',
+  );
+  final waUri = Uri.parse(
+    'https://wa.me/$normalizedPhone?text=$encodedMessage',
+  );
+  final webUri = Uri.parse(
+    'https://web.whatsapp.com/send?phone=$normalizedPhone&text=$encodedMessage',
+  );
+
+  if (kIsWeb) {
+    return launchUrl(webUri, mode: LaunchMode.externalApplication);
+  }
+
+  final openedApp = await launchUrl(
+    appUri,
+    mode: LaunchMode.externalApplication,
+  );
+  if (openedApp) return true;
+
+  return launchUrl(
+    waUri,
+    mode: LaunchMode.externalApplication,
+  );
+}
+
+class _ClientWhatsAppSheet extends StatefulWidget {
+  const _ClientWhatsAppSheet();
+
+  @override
+  State<_ClientWhatsAppSheet> createState() => _ClientWhatsAppSheetState();
+}
+
+class _ClientWhatsAppSheetState extends State<_ClientWhatsAppSheet> {
+  final TextEditingController _phoneController = TextEditingController();
+  final TextEditingController _messageController = TextEditingController();
+  bool _isSending = false;
+
+  @override
+  void dispose() {
+    _phoneController.dispose();
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  String _normalizePhone(String raw) {
+    return raw.replaceAll(RegExp(r'[^0-9]'), '');
+  }
+
+  Future<void> _send() async {
+    final messenger = ScaffoldMessenger.of(context);
+    final phone = _normalizePhone(_phoneController.text);
+    final message = _messageController.text.trim();
+
+    if (phone.length < 10 || phone.length > 12) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text('Enter a valid phone number with 10 to 12 digits.'),
+        ),
+      );
+      return;
+    }
+
+    if (message.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Message cannot be empty.')),
+      );
+      return;
+    }
+
+    setState(() => _isSending = true);
+    try {
+      final opened = await launchClientWhatsApp(
+        phoneNumber: phone,
+        message: message,
+      );
+      if (!mounted) return;
+      if (!opened) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Unable to open WhatsApp.')),
+        );
+        return;
+      }
+      Navigator.pop(context);
+    } catch (_) {
+      if (!mounted) return;
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Unable to open WhatsApp.')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isSending = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).viewInsets.bottom;
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.only(bottom: bottomInset),
+        child: Container(
+          decoration: const BoxDecoration(
+            color: AppColors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 16),
+                  decoration: BoxDecoration(
+                    color: Colors.grey[300],
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const Text(
+                'Client (WhatsApp)',
+                style: TextStyle(
+                  color: AppColors.primary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _phoneController,
+                keyboardType: TextInputType.phone,
+                decoration: InputDecoration(
+                  labelText: 'Phone Number',
+                  hintText: 'Country code + number (digits only)',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _messageController,
+                minLines: 3,
+                maxLines: 5,
+                decoration: InputDecoration(
+                  labelText: 'Message',
+                  hintText: 'Type your message',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: _isSending
+                          ? null
+                          : () {
+                              _phoneController.clear();
+                              _messageController.clear();
+                            },
+                      child: const Text('Clear'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _isSending ? null : _send,
+                      child: _isSending
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Text('Send'),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ==================== CREATE CHAT SCREEN ====================
 class CreateChatScreen extends ConsumerStatefulWidget {
-  const CreateChatScreen({super.key});
+  final bool initialIsGroupChat;
+
+  const CreateChatScreen({
+    super.key,
+    this.initialIsGroupChat = true,
+  });
 
   @override
   ConsumerState<CreateChatScreen> createState() => _CreateChatScreenState();
@@ -193,8 +540,14 @@ class CreateChatScreen extends ConsumerStatefulWidget {
 class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
   final _nameController = TextEditingController();
   final Set<String> _selectedMemberIds = {};
-  bool _isGroupChat = true; // true for Group, false for Direct
+  late bool _isGroupChat; // true for Group, false for Direct
   String _recipientRoleFilter = 'all';
+
+  @override
+  void initState() {
+    super.initState();
+    _isGroupChat = widget.initialIsGroupChat;
+  }
 
   String _normalizeRole(String role) {
     return role.trim().toLowerCase();
@@ -202,7 +555,11 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
 
   bool _matchesRoleFilter(UserModel member) {
     if (_recipientRoleFilter == 'all') return true;
-    return _normalizeRole(member.role) == _recipientRoleFilter;
+    final normalizedRole = _normalizeRole(member.role);
+    if (_recipientRoleFilter == 'lawyer') {
+      return normalizedRole == 'lawyer' || normalizedRole == 'admin';
+    }
+    return normalizedRole == _recipientRoleFilter;
   }
 
   @override
@@ -535,7 +892,6 @@ class _CreateChatScreenState extends ConsumerState<CreateChatScreen> {
                       _buildRoleFilterChip('all', 'All'),
                       _buildRoleFilterChip('lawyer', 'Lawyers'),
                       _buildRoleFilterChip('intern', 'Interns'),
-                      _buildRoleFilterChip('client', 'Clients'),
                     ],
                   ),
 

@@ -99,17 +99,18 @@ async function sendPushToUsers({
       priority: 'high',
       ttl: type === 'sos' ? 14400000 : 86400000, // 4h for SOS, 24h for normal (in ms)
       notification: {
-        channelId: type === 'sos' ? 'synapse_sos_v9' : 'synapse_main',
+        channelId: type === 'sos' ? 'synapse_sos_v10' : 'synapse_main',
         priority: type === 'sos' ? 'max' : 'high',
-        sound: type === 'sos' ? 'sos_alert_3s' : 'default',
+        sound: type === 'sos' ? undefined : 'default',
         defaultSound: type !== 'sos',
-        defaultVibrateTimings: true,
+        defaultVibrateTimings: type !== 'sos',
+        vibrateTimingsMillis: type === 'sos' ? [0, 3000] : undefined,
       },
     },
     apns: {
       payload: {
         aps: {
-          sound: type === 'sos' ? 'sos_alert_3s.mp3' : 'default',
+          sound: type === 'sos' ? undefined : 'default',
           'content-available': 1,
         },
       },
@@ -602,7 +603,18 @@ exports.listFirmMembers = functions
       throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
     }
 
-    const snap = await db.collection('users').get();
+    let snap;
+    try {
+      // Include only internal app roles.
+      snap = await db.collection('users').where('role', 'in', ['lawyer', 'intern', 'admin']).get();
+    } catch (e) {
+      // Fallback for environments where role values are inconsistent.
+      functions.logger.warn('listFirmMembers role-filter query failed, falling back to full scan', {
+        error: String(e),
+      });
+      snap = await db.collection('users').get();
+    }
+
     const items = snap.docs
       .map((doc) => {
         const d = doc.data() || {};
@@ -627,7 +639,7 @@ exports.listFirmMembers = functions
           createdAt: String(d.createdAt || ''),
         };
       })
-      .filter((u) => u.uid && u.role !== 'admin' && u.isApproved === true && u.isActive === true)
+      .filter((u) => u.uid && u.isApproved === true && u.isActive === true)
       .map((u) => ({
         uid: u.uid,
         name: u.name,
@@ -723,7 +735,6 @@ exports.updateCaseTeamMembers = functions
     const memberIds = uniqueNonEmptyStrings((data && data.memberIds) || []);
     const lawyerIds = uniqueNonEmptyStrings((data && data.lawyerIds) || []);
     const internIds = uniqueNonEmptyStrings((data && data.internIds) || []);
-    const clientIdsInput = uniqueNonEmptyStrings((data && data.clientIds) || []);
     if (!cino) {
       throw new functions.https.HttpsError('invalid-argument', 'cino is required.');
     }
@@ -753,7 +764,6 @@ exports.updateCaseTeamMembers = functions
     const nextAssignedMembers = uniqueNonEmptyStrings(memberIds);
     const nextLawyerIds = uniqueNonEmptyStrings(lawyerIds.filter((id) => nextAssignedMembers.includes(id)));
     const nextInternIds = uniqueNonEmptyStrings(internIds.filter((id) => nextAssignedMembers.includes(id)));
-    const nextClientIds = uniqueNonEmptyStrings(clientIdsInput.filter((id) => nextAssignedMembers.includes(id)));
     const nextParticipants = uniqueNonEmptyStrings([
       ownerUid,
       ...nextAssignedMembers,
@@ -763,7 +773,7 @@ exports.updateCaseTeamMembers = functions
       {
         assignedLawyerIds: nextLawyerIds,
         assignedInternIds: nextInternIds,
-        clientIds: nextClientIds,
+        clientIds: [],
         assignedMemberIds: nextAssignedMembers,
         participantIds: nextParticipants,
         updatedAt: new Date().toISOString(),
@@ -1273,6 +1283,123 @@ exports.updateTaskDetails = functions
     return {ok: true, taskId};
   });
 
+exports.updateTaskAssignableFields = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const taskId = String((data && data.taskId) || '').trim();
+    const updates = data && typeof data.updates === 'object' && data.updates ? data.updates : {};
+    if (!taskId) {
+      throw new functions.https.HttpsError('invalid-argument', 'taskId is required.');
+    }
+
+    const ref = db.collection('tasks').doc(taskId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Task not found.');
+    }
+
+    const task = snap.data() || {};
+    const isCreator = String(task.createdBy || '') === callerUid;
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
+      ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+      String(task.assignedToId || ''),
+    ]).includes(callerUid);
+
+    if (!isCreator && !isAssigned) {
+      throw new functions.https.HttpsError('permission-denied', 'Only task creator/assignee can update these fields.');
+    }
+
+    const allowed = ['autoEscalate', 'isEscalated'];
+    const payload = {};
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(updates, key)) {
+        payload[key] = updates[key];
+      }
+    }
+
+    if (Object.keys(payload).length === 0) {
+      throw new functions.https.HttpsError('invalid-argument', 'No allowed fields to update.');
+    }
+
+    payload.updatedAt = new Date().toISOString();
+    await ref.set(payload, {merge: true});
+    return {ok: true, taskId};
+  });
+
+exports.markTaskViewed = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const taskId = String((data && data.taskId) || '').trim();
+    if (!taskId) {
+      throw new functions.https.HttpsError('invalid-argument', 'taskId is required.');
+    }
+
+    const ref = db.collection('tasks').doc(taskId);
+    const [taskSnap, viewerDoc] = await Promise.all([
+      ref.get(),
+      db.collection('users').doc(callerUid).get(),
+    ]);
+
+    if (!taskSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Task not found.');
+    }
+
+    const task = taskSnap.data() || {};
+    const creatorUid = String(task.createdBy || '');
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
+      ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+      String(task.assignedToId || ''),
+    ]).includes(callerUid);
+
+    if (!isAssigned) {
+      throw new functions.https.HttpsError('permission-denied', 'Only assignees can mark viewed.');
+    }
+
+    const existingViewed = Array.isArray(task.viewedBy) ? task.viewedBy : [];
+    const alreadyViewed = existingViewed.some((v) => String((v && v.uid) || '') === callerUid);
+    if (alreadyViewed) {
+      return {ok: true, taskId, alreadyViewed: true, viewedByCount: existingViewed.length};
+    }
+
+    const viewerData = viewerDoc.exists ? viewerDoc.data() || {} : {};
+    const viewerName = String((data && data.viewerName) || viewerData.name || 'Team member');
+    const now = new Date().toISOString();
+    const viewedBy = [...existingViewed, {uid: callerUid, name: viewerName, at: now}];
+
+    await ref.set({
+      viewedBy,
+      updatedAt: now,
+    }, {merge: true});
+
+    if (creatorUid && creatorUid !== callerUid) {
+      await db.collection('notifications').add({
+        recipientUid: creatorUid,
+        senderUid: callerUid,
+        senderName: viewerName,
+        type: 'task_viewed',
+        title: 'Task Viewed',
+        body: `${viewerName} viewed your task: ${String(task.title || 'Task')}`,
+        relatedId: taskId,
+        createdAt: now,
+        isRead: false,
+      });
+    }
+
+    return {ok: true, taskId, viewedByCount: viewedBy.length};
+  });
+
 exports.updateAssignmentStatus = functions
   .region('asia-south1')
   .https.onCall(async (data, context) => {
@@ -1384,6 +1511,121 @@ exports.updateAssignmentDetails = functions
 
     await ref.set(payload, {merge: true});
     return {ok: true, assignmentId};
+  });
+
+exports.updateAssignmentAssignableFields = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const assignmentId = String((data && data.assignmentId) || '').trim();
+    const updates = data && typeof data.updates === 'object' && data.updates ? data.updates : {};
+    if (!assignmentId) {
+      throw new functions.https.HttpsError('invalid-argument', 'assignmentId is required.');
+    }
+
+    const ref = db.collection('assignments').doc(assignmentId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Assignment not found.');
+    }
+
+    const assignment = snap.data() || {};
+    const isCreator = String(assignment.createdBy || '') === callerUid;
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      String(assignment.assignedToId || ''),
+    ]).includes(callerUid);
+
+    if (!isCreator && !isAssigned) {
+      throw new functions.https.HttpsError('permission-denied', 'Only assignment creator/assignee can update these fields.');
+    }
+
+    const allowed = ['viewedBy'];
+    const payload = {};
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(updates, key)) {
+        payload[key] = updates[key];
+      }
+    }
+
+    if (Object.keys(payload).length === 0) {
+      throw new functions.https.HttpsError('invalid-argument', 'No allowed fields to update.');
+    }
+
+    payload.updatedAt = new Date().toISOString();
+    await ref.set(payload, {merge: true});
+    return {ok: true, assignmentId};
+  });
+
+exports.markAssignmentViewed = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const assignmentId = String((data && data.assignmentId) || '').trim();
+    if (!assignmentId) {
+      throw new functions.https.HttpsError('invalid-argument', 'assignmentId is required.');
+    }
+
+    const ref = db.collection('assignments').doc(assignmentId);
+    const [assignmentSnap, viewerDoc] = await Promise.all([
+      ref.get(),
+      db.collection('users').doc(callerUid).get(),
+    ]);
+
+    if (!assignmentSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Assignment not found.');
+    }
+
+    const assignment = assignmentSnap.data() || {};
+    const creatorUid = String(assignment.createdBy || '');
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      String(assignment.assignedToId || ''),
+    ]).includes(callerUid);
+
+    if (!isAssigned) {
+      throw new functions.https.HttpsError('permission-denied', 'Only assignees can mark viewed.');
+    }
+
+    const existingViewed = Array.isArray(assignment.viewedBy) ? assignment.viewedBy : [];
+    const alreadyViewed = existingViewed.some((v) => String((v && v.uid) || '') === callerUid);
+    if (alreadyViewed) {
+      return {ok: true, assignmentId, alreadyViewed: true, viewedByCount: existingViewed.length};
+    }
+
+    const viewerData = viewerDoc.exists ? viewerDoc.data() || {} : {};
+    const viewerName = String((data && data.viewerName) || viewerData.name || 'Team member');
+    const now = new Date().toISOString();
+    const viewedBy = [...existingViewed, {uid: callerUid, name: viewerName, at: now}];
+
+    await ref.set({
+      viewedBy,
+      updatedAt: now,
+    }, {merge: true});
+
+    if (creatorUid && creatorUid !== callerUid) {
+      await db.collection('notifications').add({
+        recipientUid: creatorUid,
+        senderUid: callerUid,
+        senderName: viewerName,
+        type: 'assignment_viewed',
+        title: 'Assignment Viewed',
+        body: `${viewerName} viewed your assignment: ${String(assignment.title || 'Assignment')}`,
+        relatedId: assignmentId,
+        createdAt: now,
+        isRead: false,
+      });
+    }
+
+    return {ok: true, assignmentId, viewedByCount: viewedBy.length};
   });
 
 exports.deleteTask = functions
@@ -1715,4 +1957,45 @@ exports.deleteChatForEveryone = functions
     await groupRef.delete();
 
     return {ok: true, groupId};
+  });
+
+/**
+ * Scheduled function to check for overdue tasks and escalate them if autoEscalate is true.
+ * Runs every hour.
+ */
+exports.autoEscalateTasks = functions
+  .region('asia-south1')
+  .pubsub.schedule('every 1 hours')
+  .onRun(async (context) => {
+    const now = new Date();
+    const tasksSnap = await db.collection('tasks')
+      .where('autoEscalate', '==', true)
+      .where('isEscalated', '==', false)
+      .where('status', '!=', 'completed')
+      .get();
+
+    if (tasksSnap.empty) {
+      return null;
+    }
+
+    const promises = [];
+    tasksSnap.forEach((doc) => {
+      const task = doc.data();
+      const deadline = new Date(task.deadline);
+      if (deadline < now) {
+        // Mark as escalated
+        promises.push(doc.ref.update({
+          isEscalated: true,
+          status: 'overdue',
+          updatedAt: now.toISOString(),
+        }));
+      }
+    });
+
+    if (promises.length > 0) {
+      await Promise.all(promises);
+      functions.logger.info(`Auto-escalated ${promises.length} tasks.`);
+    }
+
+    return null;
   });

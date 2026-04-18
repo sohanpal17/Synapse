@@ -13,13 +13,13 @@ import '../models/case_model.dart';
 import '../providers/providers.dart';
 import '../services/hive_service.dart';
 import '../services/notification_service.dart';
-import '../services/pdf_service.dart';
 import '../services/ecourts_import_service.dart';
 import '../models/messaging_models.dart';
 import '../utils/date_formatter.dart';
 import 'messenger_screens.dart';
 import '../services/sync_service.dart';
 import 'calendar_screens.dart';
+import '../services/firestore_service.dart';
 
 const _uuid = Uuid();
 const int _maxUploadBytes = 25 * 1024 * 1024;
@@ -88,9 +88,8 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> with WidgetsB
     // Skip if a blink is already active (don't stack).
     if (_showSosBlink) return;
 
-    // ── Trigger blink and play sound together ──
+    // ── Trigger blink only (no SOS sound) ──
     _triggerSosBlink();
-    NotificationService.playSosNotificationAudioFor3Seconds();
     NotificationService.markSosBlinkConsumed(sosId);
 
     // ── Snackbar ──
@@ -748,12 +747,6 @@ class _LawyerDashboardState extends ConsumerState<LawyerDashboard> with WidgetsB
         'route': '/notices'
       },
       {
-        'icon': Icons.description,
-        'label': 'Doc Generator',
-        'color': AppColors.accent,
-        'route': '/document-generator'
-      },
-      {
         'icon': Icons.sos,
         'label': 'SOS',
         'color': AppColors.error,
@@ -1035,9 +1028,7 @@ class _ManageCaseMembersSheetState
                   return const Center(child: Text('No firm members found.'));
                 }
 
-                String roleKey = _selectedRole == 'clients'
-                    ? 'client'
-                    : (_selectedRole == 'interns' ? 'intern' : 'lawyer');
+                String roleKey = _selectedRole == 'interns' ? 'intern' : 'lawyer';
                 final filteredMembers = validMembers
                     .where((m) => m.role.toLowerCase() == roleKey)
                     .toList();
@@ -1056,14 +1047,6 @@ class _ManageCaseMembersSheetState
                     const SizedBox(height: 8),
                     Row(
                       children: [
-                        Expanded(
-                          child: _buildTeamCategoryOption(
-                            value: 'clients',
-                            icon: Icons.person,
-                            label: 'Clients',
-                          ),
-                        ),
-                        const SizedBox(width: 8),
                         Expanded(
                           child: _buildTeamCategoryOption(
                             value: 'lawyers',
@@ -1178,17 +1161,13 @@ class _ManageCaseMembersSheetState
                       .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'intern')
                       .map((m) => m.uid)
                       .toList();
-                  final selectedClientIds = allMembers
-                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'client')
-                      .map((m) => m.uid)
-                      .toList();
 
                   ref
                       .read(casesProvider.notifier)
                       .updateCase(widget.caseModel.cino, {
                     'assignedLawyerIds': selectedLawyerIds,
                     'assignedInternIds': selectedInternIds,
-                    'clientIds': selectedClientIds,
+                    'clientIds': const <String>[],
                     'assignedMemberIds': selected,
                   }, queueSync: false);
 
@@ -1199,7 +1178,6 @@ class _ManageCaseMembersSheetState
                         memberIds: selected,
                         lawyerIds: selectedLawyerIds,
                         internIds: selectedInternIds,
-                        clientIds: selectedClientIds,
                       )
                       .then((_) {
                     if (!mounted) return;
@@ -2766,35 +2744,10 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
       padding: const EdgeInsets.all(20),
       child: Column(
         children: [
-          // Quick generate buttons
-          if (!c.isClosed) ...[
-            Row(
-              children: [
-                Expanded(
-                  child: _docButton(
-                    'Exemption\nApplication',
-                    Icons.description,
-                    Colors.blue,
-                    () => _generateDoc(c, 'exemption'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _docButton(
-                    'Adjournment\nApplication',
-                    Icons.schedule,
-                    Colors.orange,
-                    () => _generateDoc(c, 'adjournment'),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 20),
-          ],
           if (c.customDocuments.isEmpty)
             Center(
               child: Text(
-                'Documents will appear here\nafter generation or upload.',
+                'Documents will appear here\nafter upload.',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.grey[500], fontSize: 13),
               ),
@@ -3159,67 +3112,6 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
     );
   }
 
-  Widget _docButton(
-      String label, IconData icon, Color color, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: AppCard(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: color.withOpacity(0.15),
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Icon(icon, color: color, size: 24),
-            ),
-            const SizedBox(height: 8),
-            Text(label,
-                style: const TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w500,
-                    color: AppColors.text),
-                textAlign: TextAlign.center),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _generateDoc(CaseModel c, String type) async {
-    final user = ref.read(currentUserProvider);
-    try {
-      late final bytes;
-      late final title;
-      if (type == 'exemption') {
-        bytes = await PdfService.generateExemptionApplication(
-          caseData: c,
-          reason: 'Illness',
-          lawyerName: user?.name ?? 'Advocate',
-        );
-        title = 'Exemption_Application_${c.caseNumber}';
-      } else {
-        bytes = await PdfService.generateAdjournmentApplication(
-          caseData: c,
-          reason: 'Counsel engaged in another court',
-          lawyerName: user?.name ?? 'Advocate',
-        );
-        title = 'Adjournment_Application_${c.caseNumber}';
-      }
-
-      await PdfService.previewPdf(bytes, title);
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error generating document: $e')),
-        );
-      }
-    }
-  }
-
   void _showAddOptions(CaseModel c) {
     final canEditCase = _canEditCaseDetails(c);
     showModalBottomSheet(
@@ -3251,10 +3143,6 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
               _addOption(Icons.chat_bubble_outline, 'Open Case Chat', () {
                 Navigator.pop(context);
                 _createCaseChat(context, c);
-              }),
-              _addOption(Icons.description, 'Generate Document', () {
-                Navigator.pop(context);
-                Navigator.pushNamed(context, '/document-generator', arguments: c);
               }),
               _addOption(Icons.sos, 'Send SOS', () {
                 Navigator.pop(context);
@@ -4571,8 +4459,11 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
           assignedMany.contains(uid) ||
           assignedSingle == uid;
       final isParticipant = participants.contains(uid);
+      // Escalated tasks are visible to ALL firm members
+      final isEscalated = t['isEscalated'] == true;
       final isCompleted = _normalizeWorkStatus(t['status']) == 'completed';
-      final isVisibleToUser = isOwner || isPublic || isAssigned || isParticipant;
+      final isVisibleToUser =
+          isEscalated || isOwner || isPublic || isAssigned || isParticipant;
       return isVisibleToUser && (completed ? isCompleted : !isCompleted);
     }).toList();
 
@@ -4588,8 +4479,17 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       itemCount: filtered.length,
       itemBuilder: (context, index) {
         final task = filtered[index];
-        final isEscalated = task['isEscalated'] == true;
-        final status = _normalizeWorkStatus(task['status']);
+        final taskStatus = _normalizeWorkStatus(task['status']);
+        final isCompletedTask = taskStatus == 'completed';
+        final isCurrentlyEscalated = task['isEscalated'] == true;
+        final autoEscalate = task['autoEscalate'] == true;
+        final uid = (user?.uid ?? '').toString();
+
+        final viewedBy = List<Map<String, dynamic>>.from(
+            (task['viewedBy'] as List? ?? []).map((e) =>
+                Map<String, dynamic>.from(e as Map? ?? {})));
+        final iHaveViewed = viewedBy.any((v) => v['uid'] == uid);
+        final isCreator = (task['createdBy'] ?? '').toString() == uid;
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -4602,7 +4502,7 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   blurRadius: 10,
                   offset: const Offset(0, 4))
             ],
-            border: isEscalated
+            border: (!isCompletedTask && isCurrentlyEscalated)
                 ? Border.all(color: AppColors.error, width: 2)
                 : null,
           ),
@@ -4610,42 +4510,34 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
             contentPadding: const EdgeInsets.all(16),
             title: Row(
               children: [
-                if (isEscalated)
+                if (!isCompletedTask && isCurrentlyEscalated)
                   const Padding(
                       padding: EdgeInsets.only(right: 8),
                       child: Icon(Icons.warning,
                           color: AppColors.error, size: 16)),
                 Expanded(
-                    child: Text(task['title'] ?? '',
-                        style: const TextStyle(fontWeight: FontWeight.w600))),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: isEscalated
-                        ? AppColors.error.withOpacity(0.1)
-                        : (status == 'completed'
-                            ? AppColors.success.withOpacity(0.1)
-                        : status == 'inProgress'
-                          ? Colors.blue.withOpacity(0.1)
-                            : AppColors.warning.withOpacity(0.1)),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    isEscalated
-                        ? 'ESCALATED'
-                        : _taskStatusLabel(status),
-                    style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                      color: isEscalated
-                          ? AppColors.error
-                          : (status == 'completed'
-                              ? AppColors.success
-                            : status == 'inProgress'
-                              ? Colors.blue
-                              : AppColors.warning),
-                    ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(task['title'] ?? '',
+                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                      ),
+                      if (isCreator && viewedBy.isNotEmpty) ...[
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          onTap: () => _showViewedByDialog(context, viewedBy, isTask: true),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.visibility, size: 14, color: Colors.blueGrey),
+                              const SizedBox(width: 2),
+                              Text('${viewedBy.length}',
+                                  style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ],
@@ -4675,6 +4567,56 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   'Assigned: ${DateFormat('MMM d, h:mm a').format(DateTime.tryParse((task['assignedAt'] ?? task['createdAt'] ?? '').toString()) ?? DateTime.now())}',
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                 ),
+                if (!isCompletedTask && isCurrentlyEscalated) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      const Icon(Icons.warning, size: 12, color: AppColors.error),
+                      const SizedBox(width: 4),
+                      const Text(
+                        'Escalated',
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: AppColors.error,
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                ],
+                if (!isCompletedTask && !isCurrentlyEscalated && autoEscalate) ...[
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Icon(Icons.bolt, size: 12, color: Colors.green[600]),
+                      const SizedBox(width: 4),
+                      Text(
+                        'Auto Escalation: ON',
+                        style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.green[600],
+                            fontWeight: FontWeight.w600),
+                      ),
+                    ],
+                  ),
+                ],
+                if (iHaveViewed) ...[
+                  const SizedBox(height: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      'Viewed',
+                      style: TextStyle(
+                        fontSize: 9,
+                        color: Colors.blueGrey,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
             trailing: PopupMenuButton<String>(
@@ -4713,6 +4655,40 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 if (value == 'delete') {
                   if (isInternUser || !isCreator) return;
                   await ref.read(tasksProvider.notifier).deleteTask(task['id']);
+                  return;
+                }
+                if (value == 'mark_viewed') {
+                  if (!isAssignedToMe || isCreator || iHaveViewed) return;
+                  final creatorId = (task['createdBy'] ?? '').toString();
+                  final viewerName =
+                      ref.read(currentUserProvider)?.name ?? 'Someone';
+                  await ref.read(firestoreServiceProvider).notifyTaskViewed(
+                    taskId: task['id'],
+                    taskTitle: (task['title'] ?? 'Task').toString(),
+                    creatorUid: creatorId,
+                    viewerUid: uid,
+                    viewerName: viewerName,
+                  );
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Marked as viewed')));
+                  return;
+                }
+                if (value == 'show_viewed_by') {
+                  if (!isCreator) return;
+                  _showViewedByDialog(context, viewedBy, isTask: true);
+                  return;
+                }
+                if (value == 'toggle_escalation') {
+                  if (!(isCreator || isAssignedToMe)) return;
+                  final newVal = !(isCurrentlyEscalated || autoEscalate);
+                  await ref
+                      .read(tasksProvider.notifier)
+                      .updateTaskAssignableFields(task['id'], {
+                    'autoEscalate': newVal,
+                    'isEscalated': false,
+                  });
+                  return;
                 }
               },
               itemBuilder: (ctx) {
@@ -4729,6 +4705,27 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     assignedToIds.contains(uid) ||
                     assignedToId == uid;
                 final items = <PopupMenuEntry<String>>[];
+
+                if (isCreator) {
+                  final vbCount = viewedBy.length;
+                  items.add(PopupMenuItem<String>(
+                    value: 'show_viewed_by',
+                    child: Row(
+                      children: [
+                        Icon(Icons.visibility_outlined,
+                            size: 18,
+                            color: vbCount > 0 ? Colors.blueGrey : Colors.grey[400]),
+                        const SizedBox(width: 8),
+                        Text(
+                          vbCount > 0 ? 'Viewed by ($vbCount)' : 'Viewed by (none)',
+                          style: TextStyle(
+                              color: vbCount > 0 ? AppColors.text : Colors.grey[500]),
+                        ),
+                      ],
+                    ),
+                  ));
+                }
+
                 if (isCreator && status == 'inProgress') {
                   items.add(const PopupMenuItem<String>(
                     value: 'edit',
@@ -4752,11 +4749,44 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   }
                 }
 
+                if (isAssignedToMe && !isCreator && !iHaveViewed) {
+                  items.add(PopupMenuItem<String>(
+                    value: 'mark_viewed',
+                    child: Row(
+                      children: const [
+                        Icon(Icons.visibility_outlined,
+                            size: 18, color: Colors.blueGrey),
+                        SizedBox(width: 8),
+                        Text('Mark as Viewed'),
+                      ],
+                    ),
+                  ));
+                }
+
+                if ((isCreator || isAssignedToMe) && status != 'completed') {
+                  items.add(PopupMenuItem<String>(
+                    value: 'toggle_escalation',
+                    child: Text((isCurrentlyEscalated || autoEscalate)
+                        ? 'Remove Escalation'
+                        : 'Auto Escalation On'),
+                  ));
+                }
+
                 if (!isInternUser && isCreator) {
                   items.add(const PopupMenuItem<String>(
                     value: 'delete',
                     child: Text('Delete Task'),
                   ));
+                }
+
+                if (items.isEmpty) {
+                  items.add(
+                    const PopupMenuItem<String>(
+                      enabled: false,
+                      value: '_none',
+                      child: Text('No actions available'),
+                    ),
+                  );
                 }
 
                 return items;
@@ -4854,6 +4884,33 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Close'),
           ),
+        ],
+      ),
+    );
+  }
+  void _showViewedByDialog(BuildContext context, List<Map<String, dynamic>> viewedBy, {required bool isTask}) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Viewed By (${viewedBy.length})'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: viewedBy.isEmpty
+              ? const Text('No one has viewed this yet.')
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: viewedBy.length,
+                  itemBuilder: (c, i) {
+                    final v = viewedBy[i];
+                    return ListTile(
+                      leading: const CircleAvatar(child: Icon(Icons.person)),
+                      title: Text(v['name'] ?? 'Unknown User'),
+                    );
+                  },
+                ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
         ],
       ),
     );
@@ -5461,6 +5518,20 @@ class _LawyerAssignmentsScreenState
     }
   }
 
+  String _assignmentPriorityLabel(dynamic raw) {
+    final value = (raw ?? '').toString().trim().toLowerCase();
+    if (value == 'urgent') return 'URGENT';
+    if (value == 'highpriority' || value == 'high') return 'HIGH';
+    return 'NORMAL';
+  }
+
+  Color _assignmentPriorityColor(dynamic raw) {
+    final value = (raw ?? '').toString().trim().toLowerCase();
+    if (value == 'urgent') return AppColors.error;
+    if (value == 'highpriority' || value == 'high') return AppColors.warning;
+    return AppColors.success;
+  }
+
   Future<void> _setAssignmentStatus(
       Map<String, dynamic> assignment, String status) async {
     await ref
@@ -5905,16 +5976,16 @@ class _LawyerAssignmentsScreenState
       itemBuilder: (context, index) {
         final a = assignments[index];
         final status = _normalizeWorkStatus(a['status']);
-        final tagColor = a['tag'] == 'urgent'
-            ? AppColors.error
-            : a['tag'] == 'highPriority'
-                ? AppColors.warning
-                : AppColors.success;
-        final statusColor = status == 'completed'
-          ? AppColors.success
-          : status == 'inProgress'
-            ? Colors.blue
-              : AppColors.warning;
+        final priorityRaw = a['tag'] ?? a['priority'] ?? 'normal';
+        final tagColor = _assignmentPriorityColor(priorityRaw);
+        final priorityLabel = _assignmentPriorityLabel(priorityRaw);
+        final uid = (user?.uid ?? '').toString();
+
+        final viewedBy = List<Map<String, dynamic>>.from(
+            (a['viewedBy'] as List? ?? []).map((e) =>
+                Map<String, dynamic>.from(e as Map? ?? {})));
+        final iHaveViewed = viewedBy.any((v) => v['uid'] == uid);
+        final isCreator = (a['createdBy'] ?? '').toString() == uid;
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -5933,8 +6004,30 @@ class _LawyerAssignmentsScreenState
             title: Row(
               children: [
                 Expanded(
-                    child: Text(a['title'] ?? '',
-                        style: const TextStyle(fontWeight: FontWeight.w600))),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(a['title'] ?? '',
+                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                      ),
+                      if (isCreator && viewedBy.isNotEmpty) ...[
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          onTap: () => _showViewedByDialog(context, viewedBy, isTask: false),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.visibility, size: 14, color: Colors.blueGrey),
+                              const SizedBox(width: 2),
+                              Text('${viewedBy.length}',
+                                  style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
                 Container(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -5943,7 +6036,7 @@ class _LawyerAssignmentsScreenState
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
-                    (a['tag'] ?? 'normal').toString().toUpperCase(),
+                    priorityLabel,
                     style: TextStyle(
                         fontSize: 10,
                         color: tagColor,
@@ -5993,22 +6086,6 @@ class _LawyerAssignmentsScreenState
                         ],
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: statusColor.withOpacity(0.1),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Text(
-                        _assignmentStatusLabel(status),
-                        style: TextStyle(
-                            fontSize: 10,
-                            color: statusColor,
-                            fontWeight: FontWeight.bold),
-                      ),
-                    ),
                   ],
                 ),
                 const SizedBox(height: 4),
@@ -6016,9 +6093,31 @@ class _LawyerAssignmentsScreenState
                   'Assigned: ${DateFormat('MMM d, h:mm a').format(DateTime.tryParse((a['assignedAt'] ?? a['createdAt'] ?? '').toString()) ?? DateTime.now())}',
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                 ),
+                if (iHaveViewed) ...[
+                  const SizedBox(height: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      'Viewed',
+                      style: TextStyle(
+                        fontSize: 9,
+                        color: Colors.blueGrey,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
             trailing: PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert),
+              tooltip: 'Assignment actions',
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
               onSelected: (value) async {
                 final isCreator = (a['createdBy'] ?? '').toString() ==
                     (user?.uid ?? '');
@@ -6031,6 +6130,11 @@ class _LawyerAssignmentsScreenState
                 if (value == 'edit') {
                   if (!isCreator) return;
                   _showEditAssignmentDialog(a);
+                  return;
+                }
+                if (value == 'status_pending') {
+                  if (!(isAssignedToMe || isCreator)) return;
+                  await _setAssignmentStatus(a, 'pending');
                   return;
                 }
                 if (value == 'status_inProgress') {
@@ -6053,6 +6157,29 @@ class _LawyerAssignmentsScreenState
                   await ref
                       .read(assignmentsProvider.notifier)
                       .deleteAssignment(a['id']);
+                  return;
+                }
+                if (value == 'mark_viewed') {
+                  if (!isAssignedToMe || isCreator || iHaveViewed) return;
+                  final creatorId = (a['createdBy'] ?? '').toString();
+                  final viewerName =
+                      ref.read(currentUserProvider)?.name ?? 'Someone';
+                  await ref.read(firestoreServiceProvider).notifyAssignmentViewed(
+                    assignmentId: a['id'],
+                    assignmentTitle: (a['title'] ?? 'Assignment').toString(),
+                    creatorUid: creatorId,
+                    viewerUid: uid,
+                    viewerName: viewerName,
+                  );
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Marked as viewed')));
+                  return;
+                }
+                if (value == 'show_viewed_by') {
+                  if (!isCreator) return;
+                  _showViewedByDialog(context, viewedBy, isTask: false);
+                  return;
                 }
               },
               itemBuilder: (ctx) {
@@ -6066,6 +6193,28 @@ class _LawyerAssignmentsScreenState
                 final isAssignedToMe =
                     assignedToIds.contains(uid) || assignedToId == uid;
                 final items = <PopupMenuEntry<String>>[];
+
+                // Creator-only: "Viewed by" to open who has seen the assignment
+                if (isCreator) {
+                  final vbCount = viewedBy.length;
+                  items.add(PopupMenuItem<String>(
+                    value: 'show_viewed_by',
+                    child: Row(
+                      children: [
+                        Icon(Icons.visibility_outlined,
+                            size: 18,
+                            color: vbCount > 0 ? Colors.blueGrey : Colors.grey[400]),
+                        const SizedBox(width: 8),
+                        Text(
+                          vbCount > 0 ? 'Viewed by ($vbCount)' : 'Viewed by (none)',
+                          style: TextStyle(
+                              color: vbCount > 0 ? AppColors.text : Colors.grey[500]),
+                        ),
+                      ],
+                    ),
+                  ));
+                }
+
                 if (isCreator && status == 'inProgress') {
                   items.add(const PopupMenuItem<String>(
                     value: 'edit',
@@ -6087,6 +6236,21 @@ class _LawyerAssignmentsScreenState
                       child: Text('Mark In Progress'),
                     ));
                   }
+                }
+
+                // Mark as Viewed — only for assignees, only once
+                if (isAssignedToMe && !isCreator && !iHaveViewed) {
+                  items.add(PopupMenuItem<String>(
+                    value: 'mark_viewed',
+                    child: Row(
+                      children: const [
+                        Icon(Icons.visibility_outlined,
+                            size: 18, color: Colors.blueGrey),
+                        SizedBox(width: 8),
+                        Text('Mark as Viewed'),
+                      ],
+                    ),
+                  ));
                 }
 
                 if (!isInternUser && isCreator) {
@@ -6190,6 +6354,34 @@ class _LawyerAssignmentsScreenState
             onPressed: () => Navigator.pop(ctx),
             child: const Text('Close'),
           ),
+        ],
+      ),
+    );
+  }
+
+  void _showViewedByDialog(BuildContext context, List<Map<String, dynamic>> viewedBy, {required bool isTask}) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Viewed By (${viewedBy.length})'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: viewedBy.isEmpty
+              ? const Text('No one has viewed this yet.')
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: viewedBy.length,
+                  itemBuilder: (c, i) {
+                    final v = viewedBy[i];
+                    return ListTile(
+                      leading: const CircleAvatar(child: Icon(Icons.person)),
+                      title: Text(v['name'] ?? 'Unknown User'),
+                    );
+                  },
+                ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
         ],
       ),
     );

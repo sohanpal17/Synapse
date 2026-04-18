@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
@@ -41,7 +42,7 @@ class AuthService {
   List<UserModel> _sortFirmMembers(List<UserModel> members) {
     final sorted = List<UserModel>.from(members);
     sorted.sort((a, b) {
-      const order = {'lawyer': 0, 'intern': 1, 'client': 2};
+      const order = {'lawyer': 0, 'admin': 0, 'intern': 1};
       return (order[a.role] ?? 3).compareTo(order[b.role] ?? 3);
     });
     return sorted;
@@ -92,7 +93,7 @@ class AuthService {
   // ══════════ REGISTER ══════════
 
   /// Register a new user with email/password
-  /// Role must be: 'lawyer', 'intern', or 'client'
+  /// Role must be: 'lawyer' or 'intern'
   Future<UserModel> register({
     required String name,
     required String email,
@@ -294,11 +295,27 @@ class AuthService {
   /// Get all members of the firm (for team directory)
   Future<List<UserModel>> getFirmMembers() async {
     final cached = _readFirmMembersCache();
+    Future<HttpsCallableResult<dynamic>> loadFromCallable() {
+      return _functions
+          .httpsCallable(
+            'listFirmMembers',
+            options: HttpsCallableOptions(
+              timeout: const Duration(seconds: 15),
+            ),
+          )
+          .call();
+    }
+
     try {
-      final result = await _functions
-          .httpsCallable('listFirmMembers')
-          .call()
-          .timeout(const Duration(seconds: 8));
+      HttpsCallableResult<dynamic> result;
+      try {
+        result = await loadFromCallable();
+      } on TimeoutException {
+        // One retry helps when Cloud Functions is cold-starting.
+        await Future<void>.delayed(const Duration(milliseconds: 700));
+        result = await loadFromCallable();
+      }
+
       final data = result.data;
       if (data is! Map) return cached;
       final items = data['items'];
@@ -351,7 +368,7 @@ class AuthService {
   Future<List<UserModel>> getLawyers() async {
     final snapshot = await _db
         .collection('users')
-        .where('role', isEqualTo: 'lawyer')
+        .where('role', whereIn: ['lawyer', 'admin'])
         .get();
 
     return snapshot.docs.map((doc) {

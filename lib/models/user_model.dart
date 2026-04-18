@@ -36,13 +36,13 @@ class UserModel {
         createdAt = createdAt ?? DateTime.now();
 
   // ── Role Helpers ──
-  bool get isLawyer => role == 'lawyer';
+  bool get isLawyer => role == 'lawyer' || role == 'admin';
   bool get isIntern => role == 'intern';
   bool get isClient => role == 'client';
   bool get isAdmin => role == 'admin';
   bool get isApproved => approvalStatus == 'approved';
 
-  /// Lawyers and interns are internal team members
+  /// Internal team members include lawyers, interns, and admins.
   bool get isTeamMember => isLawyer || isIntern;
 
   Color get avatarColor => const Color(0xFF3C6E9F);

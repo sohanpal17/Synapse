@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -161,8 +162,7 @@ class NotificationService {
   static const String _defaultWebVapidKey =
       'BCBAtoGus_rPj-dZ3epf5s6QZbLvvffq48ZYNbD6ubdMPh1dtO-hJJgmnAXJx7jz3K7awlsLCKrISP--cC6Mvt4';
   static const String _webVapidKey = String.fromEnvironment('FIREBASE_WEB_VAPID_KEY');
-  static const String _sosChannelId = 'synapse_sos_v9';
-  static const String _sosAndroidSound = 'sos_alert_3s';
+  static const String _sosChannelId = 'synapse_sos_v10';
   static final FirebaseFunctions _functions =
       FirebaseFunctions.instanceFor(region: 'asia-south1');
 
@@ -302,6 +302,7 @@ class NotificationService {
           'synapse_sos_v6',
           'synapse_sos_v7',
           'synapse_sos_v8',
+          'synapse_sos_v9',
         ]) {
           try {
             await androidPlugin.deleteNotificationChannel(oldId);
@@ -320,14 +321,14 @@ class NotificationService {
         );
 
         await androidPlugin.createNotificationChannel(
-          const AndroidNotificationChannel(
+          AndroidNotificationChannel(
             _sosChannelId,
             'SOS Alerts',
             description: 'Urgent SOS alerts from courtroom',
             importance: Importance.max,
-            playSound: true,
-            sound: RawResourceAndroidNotificationSound(_sosAndroidSound),
+            playSound: false,
             enableVibration: true,
+            vibrationPattern: Int64List.fromList([0, 3000]),
           ),
         );
 
@@ -517,9 +518,10 @@ class NotificationService {
                 ? Importance.max
                 : Importance.high,
             priority: Priority.high,
-            playSound: true,
-            sound: channelId == _sosChannelId
-              ? const RawResourceAndroidNotificationSound(_sosAndroidSound)
+            playSound: channelId != _sosChannelId,
+            enableVibration: true,
+            vibrationPattern: channelId == _sosChannelId
+              ? Int64List.fromList([0, 3000])
               : null,
           ),
           iOS: const DarwinNotificationDetails(),
@@ -579,144 +581,23 @@ class NotificationService {
   /// Expected asset path (preferred): assets/audio/sos_alert.wav
   /// Optional web fallbacks: assets/audio/sos_alert.mp3 or assets/audio/sos_alert.ogg
   static Future<void> playSosBlinkAudio() async {
-    await startSosBlinkAudioLoop();
-    Future<void>.delayed(const Duration(seconds: 3), () {
-      if (_sosBlinkLoopActive) {
-        stopSosBlinkAudioLoop();
-      }
-    });
+    // SOS audio is intentionally disabled.
   }
 
   /// Notification-first SOS sound: play immediately for 3 seconds using
   /// a dedicated player so it doesn't conflict with blink audio.
   static Future<void> playSosNotificationAudioFor3Seconds() async {
-    try {
-      if (kIsWeb) {
-        // Use the blink audio loop on web as a fallback
-        await startSosBlinkAudioLoop();
-        Future<void>.delayed(const Duration(seconds: 3), () {
-          if (_sosBlinkLoopActive) stopSosBlinkAudioLoop();
-        });
-        return;
-      }
-
-      // Configure the notification audio player once
-      if (!_sosNotificationAudioConfigured) {
-        await _sosNotificationAudioPlayer.setPlayerMode(PlayerMode.mediaPlayer);
-        await _sosNotificationAudioPlayer.setReleaseMode(ReleaseMode.stop);
-        await _sosNotificationAudioPlayer.setVolume(1.0);
-        _sosNotificationAudioConfigured = true;
-      }
-
-      await _sosNotificationAudioPlayer.stop();
-
-      // Try the 3-second audio file first, then fall back to others
-      const candidates = [
-        'audio/sos_alert_3s.wav',
-        'audio/sos_alert.wav',
-        'audio/sos_alert.mp3',
-      ];
-
-      Exception? lastError;
-      for (final path in candidates) {
-        try {
-          debugPrint('SOS audio: trying asset $path');
-          await _sosNotificationAudioPlayer.play(
-            AssetSource(path),
-            mode: PlayerMode.mediaPlayer,
-          );
-          debugPrint('SOS audio: playing $path successfully');
-
-          // Stop after 3 seconds
-          Future<void>.delayed(const Duration(seconds: 3), () async {
-            try {
-              await _sosNotificationAudioPlayer.stop();
-            } catch (_) {}
-          });
-          return;
-        } catch (e) {
-          debugPrint('SOS audio: failed to play $path: $e');
-          lastError = e is Exception ? e : Exception(e.toString());
-        }
-      }
-
-      if (lastError != null) {
-        debugPrint('SOS audio: all candidates failed, last error: $lastError');
-      }
-    } catch (e) {
-      debugPrint('SOS notification audio error: $e');
-    }
+    // SOS audio is intentionally disabled.
   }
 
   static Future<void> startSosBlinkAudioLoop() async {
-    _sosBlinkLoopActive = true;
-    try {
-      if (kIsWeb) {
-        // Avoid web codec issues by using a generated tone loop.
-        _webSosBeepTicker?.cancel();
-        await playWebSosBeep(durationMs: 220);
-        _webSosBeepTicker = Timer.periodic(const Duration(milliseconds: 260), (_) {
-          if (!_sosBlinkLoopActive) return;
-          playWebSosBeep(durationMs: 220);
-        });
-        return;
-      }
-
-      if (!_sosBlinkAudioConfigured) {
-        await _sosBlinkAudioPlayer.setPlayerMode(PlayerMode.mediaPlayer);
-        await _sosBlinkAudioPlayer.setReleaseMode(ReleaseMode.loop);
-        await _sosBlinkAudioPlayer.setVolume(1.0);
-        _sosBlinkAudioConfigured = true;
-      } else {
-        await _sosBlinkAudioPlayer.setReleaseMode(ReleaseMode.loop);
-      }
-
-      await _sosBlinkAudioPlayer.stop();
-
-      Exception? lastError;
-      for (final candidate in _sosBlinkAudioCandidates) {
-        final path = candidate['path']!;
-        final mime = candidate['mime'];
-        try {
-          await _sosBlinkAudioPlayer.play(
-            AssetSource(path, mimeType: mime),
-            mode: PlayerMode.mediaPlayer,
-          );
-          _loggedSosAudioFailure = false;
-          debugPrint('SOS blink audio: playing $path');
-          return;
-        } catch (e) {
-          lastError = e is Exception ? e : Exception(e.toString());
-        }
-      }
-
-      if (lastError != null) {
-        throw lastError;
-      }
-    } catch (e) {
-      if (!_loggedSosAudioFailure) {
-        _loggedSosAudioFailure = true;
-        debugPrint(
-          'Failed to play SOS blink audio from assets/audio/sos_alert.*: $e',
-        );
-      }
-    }
+    _sosBlinkLoopActive = false;
   }
 
   static Future<void> stopSosBlinkAudioLoop() async {
     _sosBlinkLoopActive = false;
     _webSosBeepTicker?.cancel();
     _webSosBeepTicker = null;
-    if (!kIsWeb) {
-      try {
-        await _sosBlinkAudioPlayer.stop();
-        if (_sosBlinkAudioConfigured) {
-          await _sosBlinkAudioPlayer.setReleaseMode(ReleaseMode.stop);
-        }
-      } catch (_) {
-        // Best effort stop.
-      }
-    }
   }
 
   // ══════════ CANCEL ══════════

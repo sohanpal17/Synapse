@@ -48,9 +48,6 @@ class FirestoreService {
     participants.addAll(
       List<String>.from(map['assignedMemberIds'] ?? const []),
     );
-    participants.addAll(
-      List<String>.from(map['clientIds'] ?? const []),
-    );
 
     participants.removeWhere((id) => id.trim().isEmpty);
     map['participantIds'] = participants.toList();
@@ -237,14 +234,12 @@ class FirestoreService {
     required List<String> memberIds,
     List<String> lawyerIds = const [],
     List<String> internIds = const [],
-    List<String> clientIds = const [],
   }) async {
     await _functions.httpsCallable('updateCaseTeamMembers').call({
       'cino': cino,
       'memberIds': memberIds,
       'lawyerIds': lawyerIds,
       'internIds': internIds,
-      'clientIds': clientIds,
     });
   }
 
@@ -421,9 +416,55 @@ class FirestoreService {
     });
   }
 
+  /// Mark task as viewed (direct write allowed for assignees)
+  Future<void> notifyTaskViewed({
+    required String taskId,
+    required String taskTitle,
+    required String creatorUid,
+    required String viewerUid,
+    required String viewerName,
+  }) async {
+    await _functions.httpsCallable('markTaskViewed').call({
+      'taskId': taskId,
+      'viewerName': viewerName,
+    });
+  }
+
+  /// Update fields that assignees are permitted to write (viewedBy, isEscalated, autoEscalate).
+  Future<void> updateTaskAssignableFields(
+      String taskId, Map<String, dynamic> updates) async {
+    await _functions.httpsCallable('updateTaskAssignableFields').call({
+      'taskId': taskId,
+      'updates': updates,
+    });
+  }
+
   // ══════════════════════════════════════
   //             ASSIGNMENTS
   // ══════════════════════════════════════
+
+  /// Mark assignment as viewed
+  Future<void> notifyAssignmentViewed({
+    required String assignmentId,
+    required String assignmentTitle,
+    required String creatorUid,
+    required String viewerUid,
+    required String viewerName,
+  }) async {
+    await _functions.httpsCallable('markAssignmentViewed').call({
+      'assignmentId': assignmentId,
+      'viewerName': viewerName,
+    });
+  }
+
+  /// Update fields that assignees are permitted to write in assignments.
+  Future<void> updateAssignmentAssignableFields(
+      String assignmentId, Map<String, dynamic> updates) async {
+    await _functions.httpsCallable('updateAssignmentAssignableFields').call({
+      'assignmentId': assignmentId,
+      'updates': updates,
+    });
+  }
 
   /// Create or update an assignment
   Future<void> upsertAssignment(Map<String, dynamic> assignment) async {

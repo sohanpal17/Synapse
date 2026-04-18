@@ -17,7 +17,6 @@ import 'services/sync_service.dart';
 import 'screens/auth_screens.dart';
 import 'screens/lawyer_screens.dart';
 import 'screens/intern_screens.dart';
-import 'screens/client_screens.dart';
 import 'screens/calendar_screens.dart';
 import 'screens/messenger_screens.dart';
 import 'screens/notice_screens.dart';
@@ -262,19 +261,6 @@ class SynapseApp extends ConsumerWidget {
               allowedRoles: _allRoles,
             );
 
-          // Client routes
-          case '/client-dashboard':
-          case '/client-cases':
-          case '/case-progress':
-          case '/client-documents':
-          case '/client-calendar':
-          case '/lawyer-contact':
-            return guardedRoute(
-              settings,
-              _routeWidget(settings.name!),
-              allowedRoles: _clientRole,
-            );
-
           // Settings
           case '/settings-lawyer':
             return guardedRoute(
@@ -288,12 +274,6 @@ class SynapseApp extends ConsumerWidget {
               const SettingsScreen(userRole: 'Intern'),
               allowedRoles: _internRole,
             );
-          case '/settings-client':
-            return guardedRoute(
-              settings,
-              const SettingsScreen(userRole: 'Client'),
-              allowedRoles: _clientRole,
-            );
 
           default:
             return guardedRoute(settings, const AuthGate(), requireAuth: false);
@@ -303,11 +283,10 @@ class SynapseApp extends ConsumerWidget {
   }
 }
 
-const Set<String> _allRoles = {'lawyer', 'intern', 'client', 'admin'};
+const Set<String> _allRoles = {'lawyer', 'intern', 'admin'};
 const Set<String> _staffRoles = {'lawyer', 'intern', 'admin'};
 const Set<String> _lawyerRole = {'lawyer', 'admin'};
 const Set<String> _internRole = {'intern'};
-const Set<String> _clientRole = {'client'};
 const Set<String> _adminRole = {'admin'};
 
 Widget _routeWidget(String routeName) {
@@ -348,20 +327,8 @@ Widget _routeWidget(String routeName) {
       return const NoticeBoardScreen();
     case '/create-notice':
       return const CreateNoticeScreen();
-    case '/client-dashboard':
-      return const ClientDashboard();
-    case '/client-cases':
-      return const ClientCasesScreen();
-    case '/case-progress':
-      return const CaseProgressScreen();
-    case '/client-documents':
-      return const ClientDocumentsScreen();
-    case '/client-calendar':
-      return const ClientCalendarScreen();
-    case '/lawyer-contact':
-      return const LawyerContactScreen();
     case '/notifications':
-      return const NotificationsScreen();
+      return const NoticeBoardScreen();
     case '/admin-dashboard':
       return const AdminDashboardScreen();
     case '/courtroom-sos':

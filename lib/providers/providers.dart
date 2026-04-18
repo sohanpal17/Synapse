@@ -153,9 +153,7 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
 
     final assignedMembers = List<String>.from(map['assignedMemberIds'] ?? const []);
     if (assignedMembers.contains(uid)) return true;
-
-    final clients = List<String>.from(map['clientIds'] ?? const []);
-    return clients.contains(uid);
+    return false;
   }
 
   List<String> _computeCaseParticipants(Map<String, dynamic> map) {
@@ -164,7 +162,6 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
       ...List<String>.from(map['assignedLawyerIds'] ?? const []),
       ...List<String>.from(map['assignedInternIds'] ?? const []),
       ...List<String>.from(map['assignedMemberIds'] ?? const []),
-      ...List<String>.from(map['clientIds'] ?? const []),
     };
 
     final ownerUid = (map['ownerUid'] as String? ?? '').trim();
@@ -476,6 +473,28 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     }
   }
 
+  /// Update fields that assignees are permitted to write (viewedBy, isEscalated, autoEscalate).
+  Future<void> updateTaskAssignableFields(
+      String id, Map<String, dynamic> updates) async {
+    final existing = HiveService.get(HiveService.tasksBox, id);
+    if (existing != null) {
+      existing.addAll(updates);
+      await HiveService.put(HiveService.tasksBox, id, existing);
+      try {
+        await FirestoreService().updateTaskAssignableFields(id, updates);
+      } catch (e) {
+        // Fallback to sync queue if offline or failed
+        await SyncService.queueAction(
+          action: 'UPDATE',
+          collection: 'tasks',
+          documentId: id,
+          data: updates,
+        );
+      }
+      _load();
+    }
+  }
+
   Future<void> deleteTask(String id) async {
     final uid = _currentUid;
     final existing = HiveService.get(HiveService.tasksBox, id);
@@ -692,6 +711,27 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     _loadFromHive();
   }
 
+  /// Update fields that assignees are permitted to write in assignments.
+  Future<void> updateAssignmentAssignableFields(
+      String id, Map<String, dynamic> updates) async {
+    final existing = HiveService.get(HiveService.assignmentsBox, id);
+    if (existing != null) {
+      existing.addAll(updates);
+      await HiveService.put(HiveService.assignmentsBox, id, existing);
+      try {
+        await FirestoreService().updateAssignmentAssignableFields(id, updates);
+      } catch (e) {
+        await SyncService.queueAction(
+          action: 'UPDATE',
+          collection: 'assignments',
+          documentId: id,
+          data: updates,
+        );
+      }
+      _loadFromHive();
+    }
+  }
+
   Future<void> deleteAssignment(String id) async {
     final uid = _currentUid;
     final existing = HiveService.get(HiveService.assignmentsBox, id);
@@ -730,7 +770,9 @@ final firmMembersProvider = StreamProvider<List<UserModel>>((ref) {
   final user = ref.watch(currentUserProvider);
   if (user == null) return Stream.value([]);
   return ref.read(authServiceProvider).watchFirmMembers().map(
-        (members) => members.where((m) => m.uid != user.uid).toList(),
+        (members) => members
+            .where((m) => m.uid != user.uid && m.role.toLowerCase() != 'client')
+            .toList(),
       );
 });
 
@@ -738,7 +780,9 @@ final cachedFirmMembersProvider = Provider<List<UserModel>>((ref) {
   final user = ref.watch(currentUserProvider);
   if (user == null) return const [];
   final members = ref.read(authServiceProvider).getCachedFirmMembers();
-  return members.where((m) => m.uid != user.uid).toList();
+  return members
+      .where((m) => m.uid != user.uid && m.role.toLowerCase() != 'client')
+      .toList();
 });
 
 // ══════════ SOS ALERTS ══════════
