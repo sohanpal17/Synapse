@@ -352,6 +352,7 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
   void _listenToFirestore() {
     _sub = FirestoreService().watchTasks().listen((data) async {
+      final uid = _currentUid;
       final writes = <Future<void>>[];
       final incomingIds = <String>{};
       for (final m in data) {
@@ -360,6 +361,27 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           incomingIds.add(id);
           final normalized = Map<String, dynamic>.from(m)
             ..['status'] = _normalizeWorkStatus(m['status']);
+
+          // Keep the newest per-user clear marker to avoid completed rows
+          // briefly reappearing when an older snapshot arrives.
+          if (uid.isNotEmpty) {
+            final local = HiveService.get(HiveService.tasksBox, id);
+            final localMap = Map<String, dynamic>.from(
+              local?['clearedCompletedAtByUser'] ?? {},
+            );
+            final incomingMap = Map<String, dynamic>.from(
+              normalized['clearedCompletedAtByUser'] ?? {},
+            );
+            final localAt = DateTime.tryParse((localMap[uid] ?? '').toString());
+            final incomingAt =
+                DateTime.tryParse((incomingMap[uid] ?? '').toString());
+            if (localAt != null &&
+                (incomingAt == null || localAt.isAfter(incomingAt))) {
+              incomingMap[uid] = localAt.toIso8601String();
+              normalized['clearedCompletedAtByUser'] = incomingMap;
+            }
+          }
+
           writes.add(HiveService.put(HiveService.tasksBox, id, normalized));
         }
       }
@@ -495,6 +517,61 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     }
   }
 
+  Future<void> clearCompletedTasksForCurrentUser(List<String> taskIds) async {
+    final uid = _currentUid;
+    if (uid.isEmpty || taskIds.isEmpty) return;
+
+    final now = DateTime.now().toIso8601String();
+    for (final id in taskIds) {
+      final existing = HiveService.get(HiveService.tasksBox, id);
+      if (existing == null) continue;
+      final map =
+          Map<String, dynamic>.from(existing['clearedCompletedAtByUser'] ?? {});
+      map[uid] = now;
+      existing['clearedCompletedAtByUser'] = map;
+      existing['updatedAt'] = now;
+      await HiveService.put(HiveService.tasksBox, id, existing);
+    }
+
+    _load();
+    await FirestoreService().clearCompletedTasksForUser(taskIds);
+  }
+
+  Future<void> addTaskComment({
+    required String taskId,
+    required String text,
+    required String authorUid,
+    required String authorName,
+  }) async {
+    final existing = HiveService.get(HiveService.tasksBox, taskId);
+    if (existing == null) return;
+
+    final now = DateTime.now().toIso8601String();
+    final comment = <String, dynamic>{
+      'id': '${DateTime.now().millisecondsSinceEpoch}_$authorUid',
+      'text': text,
+      'authorUid': authorUid,
+      'authorName': authorName,
+      'createdAt': now,
+    };
+
+    final comments = List<Map<String, dynamic>>.from(
+      (existing['comments'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map? ?? {})),
+    )..add(comment);
+
+    existing['comments'] = comments;
+    existing['updatedAt'] = now;
+    await HiveService.put(HiveService.tasksBox, taskId, existing);
+    _load();
+
+    await FirestoreService().addTaskComment(
+      taskId: taskId,
+      text: text,
+      authorName: authorName,
+    );
+  }
+
   Future<void> deleteTask(String id) async {
     final uid = _currentUid;
     final existing = HiveService.get(HiveService.tasksBox, id);
@@ -585,6 +662,7 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
   void _listenToFirestore() {
     _sub = FirestoreService().watchAssignments().listen((data) async {
+      final uid = _currentUid;
       final writes = <Future<void>>[];
       final incomingIds = <String>{};
       for (final m in data) {
@@ -593,6 +671,27 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
           incomingIds.add(id);
           final normalized = Map<String, dynamic>.from(m)
             ..['status'] = _normalizeWorkStatus(m['status']);
+
+          // Keep the newest per-user clear marker to avoid completed rows
+          // briefly reappearing when an older snapshot arrives.
+          if (uid.isNotEmpty) {
+            final local = HiveService.get(HiveService.assignmentsBox, id);
+            final localMap = Map<String, dynamic>.from(
+              local?['clearedCompletedAtByUser'] ?? {},
+            );
+            final incomingMap = Map<String, dynamic>.from(
+              normalized['clearedCompletedAtByUser'] ?? {},
+            );
+            final localAt = DateTime.tryParse((localMap[uid] ?? '').toString());
+            final incomingAt =
+                DateTime.tryParse((incomingMap[uid] ?? '').toString());
+            if (localAt != null &&
+                (incomingAt == null || localAt.isAfter(incomingAt))) {
+              incomingMap[uid] = localAt.toIso8601String();
+              normalized['clearedCompletedAtByUser'] = incomingMap;
+            }
+          }
+
           writes.add(
             HiveService.put(HiveService.assignmentsBox, id, normalized),
           );
@@ -732,6 +831,62 @@ class AssignmentsNotifier extends StateNotifier<List<Map<String, dynamic>>> {
     }
   }
 
+  Future<void> clearCompletedAssignmentsForCurrentUser(
+      List<String> assignmentIds) async {
+    final uid = _currentUid;
+    if (uid.isEmpty || assignmentIds.isEmpty) return;
+
+    final now = DateTime.now().toIso8601String();
+    for (final id in assignmentIds) {
+      final existing = HiveService.get(HiveService.assignmentsBox, id);
+      if (existing == null) continue;
+      final map =
+          Map<String, dynamic>.from(existing['clearedCompletedAtByUser'] ?? {});
+      map[uid] = now;
+      existing['clearedCompletedAtByUser'] = map;
+      existing['updatedAt'] = now;
+      await HiveService.put(HiveService.assignmentsBox, id, existing);
+    }
+
+    _loadFromHive();
+    await FirestoreService().clearCompletedAssignmentsForUser(assignmentIds);
+  }
+
+  Future<void> addAssignmentComment({
+    required String assignmentId,
+    required String text,
+    required String authorUid,
+    required String authorName,
+  }) async {
+    final existing = HiveService.get(HiveService.assignmentsBox, assignmentId);
+    if (existing == null) return;
+
+    final now = DateTime.now().toIso8601String();
+    final comment = <String, dynamic>{
+      'id': '${DateTime.now().millisecondsSinceEpoch}_$authorUid',
+      'text': text,
+      'authorUid': authorUid,
+      'authorName': authorName,
+      'createdAt': now,
+    };
+
+    final comments = List<Map<String, dynamic>>.from(
+      (existing['comments'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map? ?? {})),
+    )..add(comment);
+
+    existing['comments'] = comments;
+    existing['updatedAt'] = now;
+    await HiveService.put(HiveService.assignmentsBox, assignmentId, existing);
+    _loadFromHive();
+
+    await FirestoreService().addAssignmentComment(
+      assignmentId: assignmentId,
+      text: text,
+      authorName: authorName,
+    );
+  }
+
   Future<void> deleteAssignment(String id) async {
     final uid = _currentUid;
     final existing = HiveService.get(HiveService.assignmentsBox, id);
@@ -790,6 +945,13 @@ final sosAlertsProvider = StreamProvider<List<Map<String, dynamic>>>((ref) {
   final user = ref.watch(currentUserProvider);
   if (user == null) return Stream.value(<Map<String, dynamic>>[]);
   return ref.read(firestoreServiceProvider).watchSOSAlerts(user.uid);
+});
+
+// ══════════ IN-APP NOTIFICATIONS ══════════
+final inAppNotificationsProvider = StreamProvider<List<Map<String, dynamic>>>((ref) {
+  final user = ref.watch(currentUserProvider);
+  if (user == null) return Stream.value(<Map<String, dynamic>>[]);
+  return ref.read(firestoreServiceProvider).watchInAppNotifications();
 });
 
 // ══════════ REMINDERS (Hive + Firestore) ══════════

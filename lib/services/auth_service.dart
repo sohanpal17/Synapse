@@ -336,6 +336,30 @@ class AuthService {
       return sorted;
     } catch (e) {
       debugPrint('Failed to load firm members from callable: $e');
+      try {
+        final snapshot = await _db
+            .collection('users')
+            .where('role', whereIn: ['lawyer', 'intern', 'admin'])
+            .get();
+
+        final members = snapshot.docs.map((doc) {
+          try {
+            final map = Map<String, dynamic>.from(doc.data());
+            map.putIfAbsent('uid', () => doc.id);
+            return UserModel.fromMap(map);
+          } catch (_) {
+            return null;
+          }
+        }).whereType<UserModel>().toList();
+
+        final sorted = _sortFirmMembers(members);
+        if (sorted.isNotEmpty) {
+          await _saveFirmMembersCache(sorted);
+          return sorted;
+        }
+      } catch (fallbackError) {
+        debugPrint('Fallback Firestore firm-members load failed: $fallbackError');
+      }
       return cached;
     }
   }

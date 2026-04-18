@@ -337,8 +337,13 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
   bool _selectAll = false;
 
   List<String> _memberIdsForRole(List<dynamic> members, String role) {
+    final target = role.toLowerCase().trim();
     return members
-        .where((m) => (m.role as String).toLowerCase() == role)
+        .where((m) {
+          final r = (m.role as String).toLowerCase().trim();
+          if (target == 'lawyer') return r == 'lawyer' || r == 'admin';
+          return r == target;
+        })
         .map<String>((m) => m.uid as String)
         .toList();
   }
@@ -714,7 +719,13 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                     ? 'lawyer'
                                     : 'intern';
                             final roleMembers = members
-                                .where((m) => m.role == targetRole)
+                                .where((m) {
+                                  final r = m.role.toLowerCase().trim();
+                                  if (targetRole == 'lawyer') {
+                                    return r == 'lawyer' || r == 'admin';
+                                  }
+                                  return r == targetRole;
+                                })
                                 .toList();
 
                             if (roleMembers.isEmpty) {

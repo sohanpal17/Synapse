@@ -439,6 +439,25 @@ class FirestoreService {
     });
   }
 
+  /// Clear completed tasks only for current user.
+  Future<void> clearCompletedTasksForUser(List<String> taskIds) async {
+    await _functions.httpsCallable('clearCompletedTasksForUser').call({
+      'taskIds': taskIds,
+    });
+  }
+
+  Future<void> addTaskComment({
+    required String taskId,
+    required String text,
+    required String authorName,
+  }) async {
+    await _functions.httpsCallable('addTaskComment').call({
+      'taskId': taskId,
+      'text': text,
+      'authorName': authorName,
+    });
+  }
+
   // ══════════════════════════════════════
   //             ASSIGNMENTS
   // ══════════════════════════════════════
@@ -463,6 +482,26 @@ class FirestoreService {
     await _functions.httpsCallable('updateAssignmentAssignableFields').call({
       'assignmentId': assignmentId,
       'updates': updates,
+    });
+  }
+
+  /// Clear completed assignments only for current user.
+  Future<void> clearCompletedAssignmentsForUser(
+      List<String> assignmentIds) async {
+    await _functions.httpsCallable('clearCompletedAssignmentsForUser').call({
+      'assignmentIds': assignmentIds,
+    });
+  }
+
+  Future<void> addAssignmentComment({
+    required String assignmentId,
+    required String text,
+    required String authorName,
+  }) async {
+    await _functions.httpsCallable('addAssignmentComment').call({
+      'assignmentId': assignmentId,
+      'text': text,
+      'authorName': authorName,
     });
   }
 
@@ -667,6 +706,43 @@ class FirestoreService {
     await _functions.httpsCallable('deleteNotice').call({
       'noticeId': noticeId,
     });
+  }
+
+  // ══════════════════════════════════════
+  //            IN-APP NOTIFICATIONS
+  // ══════════════════════════════════════
+
+  /// Real-time stream of notifications for current user.
+  Stream<List<Map<String, dynamic>>> watchInAppNotifications() {
+    final uid = _currentUid;
+    if (uid.isEmpty) return Stream.value(const []);
+
+    return _db
+        .collection('notifications')
+        .where('recipientUid', isEqualTo: uid)
+        .snapshots()
+        .map((snapshot) {
+      final items = snapshot.docs
+          .map((d) => {
+                'id': d.id,
+                ...d.data(),
+              })
+          .toList();
+
+      items.sort((a, b) {
+        final aRaw = (a['createdAt'] ?? '').toString();
+        final bRaw = (b['createdAt'] ?? '').toString();
+        return bRaw.compareTo(aRaw);
+      });
+      return items;
+    });
+  }
+
+  Future<void> markNotificationRead(String notificationId) async {
+    await _db.collection('notifications').doc(notificationId).set({
+      'isRead': true,
+      'readAt': DateTime.now().toIso8601String(),
+    }, SetOptions(merge: true));
   }
 
   // ══════════════════════════════════════

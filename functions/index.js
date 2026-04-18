@@ -165,6 +165,38 @@ async function sendPushToUsers({
   };
 }
 
+async function createInAppNotifications({
+  recipientIds,
+  senderUid = '',
+  senderName = 'System',
+  type,
+  title,
+  body,
+  relatedId = '',
+  excludeUserIds = [],
+}) {
+  const excluded = new Set(uniqueNonEmptyStrings(excludeUserIds));
+  const targets = uniqueNonEmptyStrings(recipientIds).filter((uid) => !excluded.has(uid));
+  if (targets.length === 0) return;
+
+  const now = new Date().toISOString();
+  const writes = targets.map((uid) =>
+    db.collection('notifications').add({
+      recipientUid: uid,
+      senderUid: String(senderUid || ''),
+      senderName: String(senderName || 'System'),
+      type: String(type || 'general'),
+      title: String(title || 'Notification'),
+      body: String(body || ''),
+      relatedId: String(relatedId || ''),
+      createdAt: now,
+      isRead: false,
+    })
+  );
+
+  await Promise.allSettled(writes);
+}
+
 exports.onSosAlertCreated = functions
   .region('asia-south1')
   .firestore
@@ -265,6 +297,7 @@ exports.onTaskCreated = functions
     const task = snap.data() || {};
     const createdBy = String(task.createdBy || '');
     const title = String(task.title || 'Task');
+    const taskId = String(task.id || context.params.taskId);
 
     const recipientIds = uniqueNonEmptyStrings([
       ...(Array.isArray(task.participantIds) ? task.participantIds : []),
@@ -273,6 +306,17 @@ exports.onTaskCreated = functions
       ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
     ]);
 
+    await createInAppNotifications({
+      recipientIds,
+      senderUid: createdBy,
+      senderName: 'Task Creator',
+      type: 'task_created',
+      title: 'New Task Assigned',
+      body: title,
+      relatedId: taskId,
+      excludeUserIds: [createdBy],
+    });
+
     const response = await sendPushToUsers({
       title: 'New Task Assigned',
       body: title,
@@ -280,7 +324,7 @@ exports.onTaskCreated = functions
       userIds: recipientIds,
       excludeUserIds: [createdBy],
       data: {
-        taskId: String(task.id || context.params.taskId),
+        taskId,
         caseId: String(task.caseId || ''),
         createdBy,
       },
@@ -310,9 +354,21 @@ exports.onTaskUpdated = functions
 
     const creator = String(after.createdBy || '');
     const title = String(after.title || 'Task');
+    const taskId = String(after.id || context.params.taskId);
     const lawyers = await getUserIdsByRole('lawyer');
     const interns = await getUserIdsByRole('intern');
-    const recipients = uniqueNonEmptyStrings([...lawyers, ...interns]);
+    const admins = await getUserIdsByRole('admin');
+    const recipients = uniqueNonEmptyStrings([...lawyers, ...interns, ...admins]);
+
+    await createInAppNotifications({
+      recipientIds: recipients,
+      senderUid: creator,
+      senderName: 'System',
+      type: 'task_escalated',
+      title: 'Task Escalated',
+      body: `${title} is now overdue and escalated.`,
+      relatedId: taskId,
+    });
 
     const response = await sendPushToUsers({
       title: 'Task Escalated',
@@ -321,7 +377,7 @@ exports.onTaskUpdated = functions
       userIds: recipients,
       excludeUserIds: [],
       data: {
-        taskId: String(after.id || context.params.taskId),
+        taskId,
         caseId: String(after.caseId || ''),
         createdBy: creator,
       },
@@ -343,12 +399,24 @@ exports.onAssignmentCreated = functions
     const assignment = snap.data() || {};
     const createdBy = String(assignment.createdBy || '');
     const title = String(assignment.title || 'Assignment');
+    const assignmentId = String(assignment.id || context.params.assignmentId);
 
     const recipientIds = uniqueNonEmptyStrings([
       ...(Array.isArray(assignment.participantIds) ? assignment.participantIds : []),
       ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
       String(assignment.assignedToId || ''),
     ]);
+
+    await createInAppNotifications({
+      recipientIds,
+      senderUid: createdBy,
+      senderName: 'Assignment Creator',
+      type: 'assignment_created',
+      title: 'New Assignment',
+      body: title,
+      relatedId: assignmentId,
+      excludeUserIds: [createdBy],
+    });
 
     const response = await sendPushToUsers({
       title: 'New Assignment',
@@ -357,7 +425,7 @@ exports.onAssignmentCreated = functions
       userIds: recipientIds,
       excludeUserIds: [createdBy],
       data: {
-        assignmentId: String(assignment.id || context.params.assignmentId),
+        assignmentId,
         caseId: String(assignment.caseId || ''),
         createdBy,
       },
@@ -386,12 +454,23 @@ exports.onAssignmentUpdated = functions
     }
 
     const title = String(after.title || 'Assignment');
+    const assignmentId = String(after.id || context.params.assignmentId);
     const recipientIds = uniqueNonEmptyStrings([
       ...(Array.isArray(after.participantIds) ? after.participantIds : []),
       ...(Array.isArray(after.assignedToIds) ? after.assignedToIds : []),
       String(after.assignedToId || ''),
       String(after.createdBy || ''),
     ]);
+
+    await createInAppNotifications({
+      recipientIds,
+      senderUid: String(after.createdBy || ''),
+      senderName: 'System',
+      type: 'assignment_status',
+      title: 'Assignment Updated',
+      body: `${title} marked as ${afterStatus}.`,
+      relatedId: assignmentId,
+    });
 
     const response = await sendPushToUsers({
       title: 'Assignment Updated',
@@ -400,7 +479,7 @@ exports.onAssignmentUpdated = functions
       userIds: recipientIds,
       excludeUserIds: [],
       data: {
-        assignmentId: String(after.id || context.params.assignmentId),
+        assignmentId,
         caseId: String(after.caseId || ''),
         status: afterStatus,
       },
@@ -427,7 +506,9 @@ exports.onReminderCreated = functions
 
     let recipientIds = [];
     if (visibility === 'lawyers') {
-      recipientIds = await getUserIdsByRole('lawyer');
+      const lawyers = await getUserIdsByRole('lawyer');
+      const admins = await getUserIdsByRole('admin');
+      recipientIds = uniqueNonEmptyStrings([...lawyers, ...admins]);
     } else if (visibility === 'interns') {
       recipientIds = await getUserIdsByRole('intern');
     } else if (visibility === 'specificUsers') {
@@ -1181,12 +1262,17 @@ exports.updateTaskStatus = functions
     }
 
     const ref = db.collection('tasks').doc(taskId);
-    const snap = await ref.get();
+    const [snap, callerDoc] = await Promise.all([
+      ref.get(),
+      db.collection('users').doc(callerUid).get(),
+    ]);
     if (!snap.exists) {
       throw new functions.https.HttpsError('not-found', 'Task not found.');
     }
 
     const task = snap.data() || {};
+    const callerRole = String((callerDoc.exists ? callerDoc.data() || {} : {}).role || '').toLowerCase();
+    const isInternalMember = callerRole === 'lawyer' || callerRole === 'intern' || callerRole === 'admin';
     const isCreator = String(task.createdBy || '') === callerUid;
     const isParticipant = uniqueNonEmptyStrings(task.participantIds || []).includes(callerUid);
     const isAssigned = uniqueNonEmptyStrings([
@@ -1194,14 +1280,17 @@ exports.updateTaskStatus = functions
       ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
       String(task.assignedToId || ''),
     ]).includes(callerUid);
+    const isEscalated = task.isEscalated === true;
+    const canManageEscalatedStatus = isEscalated && isInternalMember;
 
-    if (!isCreator && !isParticipant && !isAssigned) {
+    if (!isCreator && !isParticipant && !isAssigned && !canManageEscalatedStatus) {
       throw new functions.https.HttpsError('permission-denied', 'Not allowed to update this task status.');
     }
 
     await ref.set(
       {
         status,
+        completedAt: status === 'completed' ? new Date().toISOString() : null,
         updatedAt: new Date().toISOString(),
       },
       {merge: true}
@@ -1400,6 +1489,93 @@ exports.markTaskViewed = functions
     return {ok: true, taskId, viewedByCount: viewedBy.length};
   });
 
+exports.addTaskComment = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const taskId = String((data && data.taskId) || '').trim();
+    const text = String((data && data.text) || '').trim();
+    if (!taskId || !text) {
+      throw new functions.https.HttpsError('invalid-argument', 'taskId and text are required.');
+    }
+
+    const taskRef = db.collection('tasks').doc(taskId);
+    const [taskSnap, userSnap] = await Promise.all([
+      taskRef.get(),
+      db.collection('users').doc(callerUid).get(),
+    ]);
+
+    if (!taskSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Task not found.');
+    }
+
+    const task = taskSnap.data() || {};
+    const isCreator = String(task.createdBy || '') === callerUid;
+    const isParticipant = uniqueNonEmptyStrings(task.participantIds || []).includes(callerUid);
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
+      ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+      String(task.assignedToId || ''),
+    ]).includes(callerUid);
+    const isVisible = task.isPublic === true;
+
+    if (!isCreator && !isParticipant && !isAssigned && !isVisible) {
+      throw new functions.https.HttpsError('permission-denied', 'Not allowed to comment on this task.');
+    }
+
+    const userData = userSnap.exists ? userSnap.data() || {} : {};
+    const authorName = String(userData.name || (data && data.authorName) || 'Team member');
+    const now = new Date().toISOString();
+    const comment = {
+      id: `${Date.now()}_${callerUid}`,
+      text,
+      authorUid: callerUid,
+      authorName,
+      createdAt: now,
+    };
+
+    const comments = Array.isArray(task.comments) ? [...task.comments, comment] : [comment];
+
+    await taskRef.set(
+      {
+        comments,
+        updatedAt: now,
+      },
+      {merge: true}
+    );
+
+    const recipientIds = uniqueNonEmptyStrings([
+      String(task.createdBy || ''),
+      ...(Array.isArray(task.participantIds) ? task.participantIds : []),
+      ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
+      ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+      String(task.assignedToId || ''),
+    ]);
+
+    const notificationWrites = recipientIds.map((uid) =>
+      db.collection('notifications').add({
+        recipientUid: uid,
+        senderUid: callerUid,
+        senderName: authorName,
+        type: 'task_comment',
+        title: 'Task Comment',
+        body: `${authorName} commented on task: ${String(task.title || 'Task')}`,
+        relatedId: taskId,
+        createdAt: now,
+        isRead: false,
+      })
+    );
+    if (notificationWrites.length > 0) {
+      await Promise.allSettled(notificationWrites);
+    }
+
+    return {ok: true, taskId, comment};
+  });
+
 exports.updateAssignmentStatus = functions
   .region('asia-south1')
   .https.onCall(async (data, context) => {
@@ -1435,6 +1611,7 @@ exports.updateAssignmentStatus = functions
     await ref.set(
       {
         status,
+        completedAt: status === 'completed' ? new Date().toISOString() : null,
         updatedAt: new Date().toISOString(),
       },
       {merge: true}
@@ -1626,6 +1803,205 @@ exports.markAssignmentViewed = functions
     }
 
     return {ok: true, assignmentId, viewedByCount: viewedBy.length};
+  });
+
+exports.addAssignmentComment = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const assignmentId = String((data && data.assignmentId) || '').trim();
+    const text = String((data && data.text) || '').trim();
+    if (!assignmentId || !text) {
+      throw new functions.https.HttpsError('invalid-argument', 'assignmentId and text are required.');
+    }
+
+    const assignmentRef = db.collection('assignments').doc(assignmentId);
+    const [assignmentSnap, userSnap] = await Promise.all([
+      assignmentRef.get(),
+      db.collection('users').doc(callerUid).get(),
+    ]);
+
+    if (!assignmentSnap.exists) {
+      throw new functions.https.HttpsError('not-found', 'Assignment not found.');
+    }
+
+    const assignment = assignmentSnap.data() || {};
+    const isCreator = String(assignment.createdBy || '') === callerUid;
+    const isParticipant = uniqueNonEmptyStrings(assignment.participantIds || []).includes(callerUid);
+    const isAssigned = uniqueNonEmptyStrings([
+      ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      String(assignment.assignedToId || ''),
+    ]).includes(callerUid);
+
+    if (!isCreator && !isParticipant && !isAssigned) {
+      throw new functions.https.HttpsError('permission-denied', 'Not allowed to comment on this assignment.');
+    }
+
+    const userData = userSnap.exists ? userSnap.data() || {} : {};
+    const authorName = String(userData.name || (data && data.authorName) || 'Team member');
+    const now = new Date().toISOString();
+    const comment = {
+      id: `${Date.now()}_${callerUid}`,
+      text,
+      authorUid: callerUid,
+      authorName,
+      createdAt: now,
+    };
+
+    const comments = Array.isArray(assignment.comments)
+      ? [...assignment.comments, comment]
+      : [comment];
+
+    await assignmentRef.set(
+      {
+        comments,
+        updatedAt: now,
+      },
+      {merge: true}
+    );
+
+    const recipientIds = uniqueNonEmptyStrings([
+      String(assignment.createdBy || ''),
+      ...(Array.isArray(assignment.participantIds) ? assignment.participantIds : []),
+      ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      String(assignment.assignedToId || ''),
+    ]);
+
+    const notificationWrites = recipientIds.map((uid) =>
+      db.collection('notifications').add({
+        recipientUid: uid,
+        senderUid: callerUid,
+        senderName: authorName,
+        type: 'assignment_comment',
+        title: 'Assignment Comment',
+        body: `${authorName} commented on assignment: ${String(assignment.title || 'Assignment')}`,
+        relatedId: assignmentId,
+        createdAt: now,
+        isRead: false,
+      })
+    );
+    if (notificationWrites.length > 0) {
+      await Promise.allSettled(notificationWrites);
+    }
+
+    return {ok: true, assignmentId, comment};
+  });
+
+exports.clearCompletedTasksForUser = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const taskIds = uniqueNonEmptyStrings((data && data.taskIds) || []);
+    if (taskIds.length === 0) {
+      return {ok: true, updatedCount: 0};
+    }
+
+    const now = new Date().toISOString();
+    let updatedCount = 0;
+
+    for (const chunkIds of chunk(taskIds, 300)) {
+      const refs = chunkIds.map((id) => db.collection('tasks').doc(id));
+      const snaps = await db.getAll(...refs);
+      const writes = [];
+
+      for (const snap of snaps) {
+        if (!snap.exists) continue;
+        const task = snap.data() || {};
+
+        const status = normalizeWorkStatus(task.status);
+        if (status !== 'completed') continue;
+
+        const isCreator = String(task.createdBy || '') === callerUid;
+        const isParticipant = uniqueNonEmptyStrings(task.participantIds || []).includes(callerUid);
+        const isAssigned = uniqueNonEmptyStrings([
+          ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
+          ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+          String(task.assignedToId || ''),
+        ]).includes(callerUid);
+        if (!isCreator && !isParticipant && !isAssigned) continue;
+
+        writes.push(
+          snap.ref.set(
+            {
+              [`clearedCompletedAtByUser.${callerUid}`]: now,
+              updatedAt: now,
+            },
+            {merge: true}
+          )
+        );
+      }
+
+      if (writes.length > 0) {
+        await Promise.all(writes);
+        updatedCount += writes.length;
+      }
+    }
+
+    return {ok: true, updatedCount};
+  });
+
+exports.clearCompletedAssignmentsForUser = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const assignmentIds = uniqueNonEmptyStrings((data && data.assignmentIds) || []);
+    if (assignmentIds.length === 0) {
+      return {ok: true, updatedCount: 0};
+    }
+
+    const now = new Date().toISOString();
+    let updatedCount = 0;
+
+    for (const chunkIds of chunk(assignmentIds, 300)) {
+      const refs = chunkIds.map((id) => db.collection('assignments').doc(id));
+      const snaps = await db.getAll(...refs);
+      const writes = [];
+
+      for (const snap of snaps) {
+        if (!snap.exists) continue;
+        const assignment = snap.data() || {};
+
+        const status = normalizeWorkStatus(assignment.status);
+        if (status !== 'completed') continue;
+
+        const isCreator = String(assignment.createdBy || '') === callerUid;
+        const isParticipant = uniqueNonEmptyStrings(assignment.participantIds || []).includes(callerUid);
+        const isAssigned = uniqueNonEmptyStrings([
+          ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+          String(assignment.assignedToId || ''),
+        ]).includes(callerUid);
+        if (!isCreator && !isParticipant && !isAssigned) continue;
+
+        writes.push(
+          snap.ref.set(
+            {
+              [`clearedCompletedAtByUser.${callerUid}`]: now,
+              updatedAt: now,
+            },
+            {merge: true}
+          )
+        );
+      }
+
+      if (writes.length > 0) {
+        await Promise.all(writes);
+        updatedCount += writes.length;
+      }
+    }
+
+    return {ok: true, updatedCount};
   });
 
 exports.deleteTask = functions

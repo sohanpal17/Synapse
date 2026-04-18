@@ -10,6 +10,7 @@ import 'package:uuid/uuid.dart';
 import '../main.dart';
 import '../widgets/common_widgets.dart';
 import '../models/case_model.dart';
+import '../models/user_model.dart';
 import '../providers/providers.dart';
 import '../services/hive_service.dart';
 import '../services/notification_service.dart';
@@ -33,6 +34,12 @@ String _normalizeWorkStatus(dynamic raw) {
     return 'completed';
   }
   return 'inProgress';
+}
+
+String _formatCommentTimestamp(dynamic raw) {
+  final dt = DateFormatter.parseDateNullable(raw);
+  if (dt == null) return 'Unknown time';
+  return DateFormat('dd MMM yyyy, h:mm a').format(dt);
 }
 
 // ==================== LAWYER DASHBOARD ====================
@@ -971,6 +978,16 @@ class _ManageCaseMembersSheetState
   late List<String> _selectedMemberIds;
   String _selectedRole = 'lawyers';
 
+  bool _isLawyerLikeRole(String role) {
+    final r = role.toLowerCase().trim();
+    return r == 'lawyer' || r == 'admin';
+  }
+
+  bool _isInternLikeRole(String role) {
+    final r = role.toLowerCase().trim();
+    return r == 'intern' || r == 'junior' || r == 'interns';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -1028,9 +1045,10 @@ class _ManageCaseMembersSheetState
                   return const Center(child: Text('No firm members found.'));
                 }
 
-                String roleKey = _selectedRole == 'interns' ? 'intern' : 'lawyer';
                 final filteredMembers = validMembers
-                    .where((m) => m.role.toLowerCase() == roleKey)
+                  .where((m) => _selectedRole == 'interns'
+                    ? _isInternLikeRole(m.role)
+                    : _isLawyerLikeRole(m.role))
                     .toList();
 
                 return ListView(
@@ -1154,11 +1172,15 @@ class _ManageCaseMembersSheetState
                   final selected = List<String>.from(_selectedMemberIds);
                   final allMembers = ref.read(firmMembersProvider).valueOrNull ?? const [];
                   final selectedLawyerIds = allMembers
-                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'lawyer')
+                      .where((m) =>
+                        selected.contains(m.uid) &&
+                        _isLawyerLikeRole(m.role))
                       .map((m) => m.uid)
                       .toList();
                   final selectedInternIds = allMembers
-                      .where((m) => selected.contains(m.uid) && m.role.toLowerCase() == 'intern')
+                      .where((m) =>
+                        selected.contains(m.uid) &&
+                        _isInternLikeRole(m.role))
                       .map((m) => m.uid)
                       .toList();
 
@@ -2458,27 +2480,29 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                     final isAssignedToMe = assignedJuniorIds.contains(uid) ||
                         assignedToIds.contains(uid) ||
                         assignedToId == uid;
+                    final canManageStatus =
+                        isEscalated || isAssignedToMe || isCreator;
                     if (value == 'edit') {
                       if (!isCreator) return;
                       _showEditCaseTaskDialog(task);
                       return;
                     }
                     if (value == 'status_inProgress') {
-                      if (!(isAssignedToMe || isCreator)) return;
+                      if (!canManageStatus) return;
                       await ref.read(tasksProvider.notifier).updateTask(task['id'], {
                         'status': 'inProgress',
                       });
                       return;
                     }
                     if (value == 'status_completed') {
-                      if (!(isAssignedToMe || isCreator)) return;
+                      if (!canManageStatus) return;
                       await ref.read(tasksProvider.notifier).updateTask(task['id'], {
                         'status': 'completed',
                       });
                       return;
                     }
                     if (value == 'status_back_inProgress') {
-                      if (!(isAssignedToMe || isCreator)) return;
+                      if (!canManageStatus) return;
                       await ref.read(tasksProvider.notifier).updateTask(task['id'], {
                         'status': 'inProgress',
                       });
@@ -2501,6 +2525,8 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                     final isAssignedToMe = assignedJuniorIds.contains(uid) ||
                         assignedToIds.contains(uid) ||
                         assignedToId == uid;
+                    final canManageStatus =
+                      isEscalated || isAssignedToMe || isCreator;
                     final status = _normalizeWorkStatus(task['status']);
                     final items = <PopupMenuEntry<String>>[];
                     if (isCreator && status == 'inProgress') {
@@ -2511,14 +2537,14 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                     }
 
                     if (status == 'inProgress') {
-                      if (isAssignedToMe || isCreator) {
+                      if (canManageStatus) {
                         items.add(const PopupMenuItem<String>(
                           value: 'status_completed',
                           child: Text('Mark Completed'),
                         ));
                       }
                     } else if (status == 'completed') {
-                      if (isAssignedToMe || isCreator) {
+                      if (canManageStatus) {
                         items.add(const PopupMenuItem<String>(
                           value: 'status_back_inProgress',
                           child: Text('Mark In Progress'),
@@ -3441,6 +3467,8 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
   DateTime _deadline = DateTime.now().add(const Duration(days: 3));
   bool _autoEscalate = true;
   String? _selectedCaseId;
+  bool _taskClearMode = false;
+  final Set<String> _selectedCompletedTaskIds = <String>{};
 
   @override
   void initState() {
@@ -3692,8 +3720,14 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
               (_visibility == 'lawyers' || _visibility == 'interns'))
             members.when(
               data: (memberList) {
-                final roleFilter =
-                    _visibility == 'lawyers' ? 'lawyer' : 'intern';
+                bool isLawyerLikeRole(String role) {
+                  final r = role.toLowerCase().trim();
+                  return r == 'lawyer' || r == 'admin';
+                }
+                bool isInternLikeRole(String role) {
+                  final r = role.toLowerCase().trim();
+                  return r == 'intern' || r == 'junior' || r == 'interns';
+                }
 
                 // Restrict to case members only for locked case-specific task flow.
                 final CaseModel? selectedCase = _selectedCaseId != null
@@ -3705,8 +3739,10 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 final caseMemberIds = selectedCase?.assignedMemberIds ?? [];
 
                 final filteredMembers = memberList.where((m) {
-                  if ((m.role as String).toLowerCase() != roleFilter ||
-                      m.uid == currentUser?.uid) {
+                  final matchesRole = _visibility == 'lawyers'
+                      ? isLawyerLikeRole(m.role)
+                      : isInternLikeRole(m.role);
+                  if (!matchesRole || m.uid == currentUser?.uid) {
                     return false;
                   }
                   if (widget.lockCaseSelection &&
@@ -3760,7 +3796,7 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     if (filteredMembers.isEmpty)
                       Text(
                           widget.lockCaseSelection && selectedCase != null
-                          ? 'No $roleFilter members assigned to this case. Manage members in Case Details.'
+                          ? 'No members assigned to this role in this case. Manage members in Case Details.'
                           : 'No members found for this role.',
                           style: const TextStyle(
                               color: Colors.grey, fontSize: 13)),
@@ -4095,7 +4131,15 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
     final descriptionController =
         TextEditingController(text: task['description'] ?? '');
     final activeCases = ref.read(casesProvider).where((c) => !c.isClosed).toList();
-    final members = ref.read(firmMembersProvider).valueOrNull ?? [];
+    final liveMembers = ref.read(firmMembersProvider).valueOrNull ?? [];
+    final cachedMembers = ref.read(cachedFirmMembersProvider);
+    final memberByUid = <String, UserModel>{
+      for (final m in [...cachedMembers, ...liveMembers]) m.uid.trim(): m,
+    };
+    if (currentUser != null && currentUser.uid.trim().isNotEmpty) {
+      memberByUid[currentUser.uid.trim()] = currentUser;
+    }
+    final members = memberByUid.values.toList();
     DateTime selectedDeadline = task['deadline'] != null
         ? DateTime.tryParse(task['deadline']) ?? DateTime.now()
         : DateTime.now();
@@ -4104,11 +4148,54 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
         ? null
         : (task['caseId'] ?? '').toString();
     bool selectedAutoEscalate = task['autoEscalate'] == true;
+    String uidOf(UserModel m) => m.uid.trim();
+    bool isLawyerLikeRole(String role) {
+      final r = role.toLowerCase().trim();
+      return r == 'lawyer' || r == 'admin';
+    }
+
+    bool isInternLikeRole(String role) {
+      final r = role.toLowerCase().trim();
+      return r == 'intern' || r == 'junior' || r == 'interns';
+    }
+
     final selectedMemberIds = <String>{
-      ...List<String>.from(task['assignedJuniorIds'] ?? const []),
-      ...List<String>.from(task['assignedToIds'] ?? const []),
-      (task['assignedToId'] ?? '').toString(),
-    }..removeWhere((id) => id.trim().isEmpty);
+      ...List<String>.from(task['assignedJuniorIds'] ?? const [])
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty),
+      ...List<String>.from(task['assignedToIds'] ?? const [])
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty),
+      (task['assignedToId'] ?? '').toString().trim(),
+    }..removeWhere((id) => id.isEmpty);
+
+    // Fallback for legacy/incomplete rows: recover assignees from participantIds.
+    final creatorId = (task['createdBy'] ?? '').toString().trim();
+    final participantAssigneeIds = List<String>.from(task['participantIds'] ?? const [])
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty && id != creatorId)
+        .where(memberByUid.containsKey)
+        .toSet();
+    if (participantAssigneeIds.length > selectedMemberIds.length) {
+      selectedMemberIds.addAll(participantAssigneeIds);
+    }
+
+    final selectedRoles = members
+      .where((m) => selectedMemberIds.contains(uidOf(m)))
+      .map((m) => (m.role).toLowerCase())
+      .toSet();
+    final hasLawyerAssignee =
+      selectedRoles.any(isLawyerLikeRole);
+    final hasInternAssignee = selectedRoles.any(isInternLikeRole);
+    if (selectedVisibility != 'lawyers' && selectedVisibility != 'interns') {
+      if (hasLawyerAssignee && !hasInternAssignee) {
+        selectedVisibility = 'lawyers';
+      } else if (hasInternAssignee && !hasLawyerAssignee) {
+        selectedVisibility = 'interns';
+      } else {
+        selectedVisibility = 'lawyers';
+      }
+    }
 
     final shouldSave = await showDialog<bool>(
       context: context,
@@ -4278,30 +4365,35 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                       ),
                     ],
                   ),
-                  if (selectedVisibility == 'lawyers' || selectedVisibility == 'interns') ...[
+                    if (selectedVisibility == 'lawyers' ||
+                      selectedVisibility == 'interns') ...[
                     const SizedBox(height: 12),
                     Builder(
                       builder: (_) {
-                        final filteredMembers = members
-                            .where((m) =>
-                                m.uid != currentUser?.uid &&
-                                (m.role as String).toLowerCase() ==
-                                    (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
-                            .toList();
-                        final allSelected = filteredMembers.isNotEmpty &&
-                            filteredMembers.every((m) => selectedMemberIds.contains(m.uid));
+                      final displayMembers = members
+                        .where((m) =>
+                          (uidOf(m) != (currentUser?.uid ?? '').trim() ||
+                            selectedMemberIds.contains(uidOf(m))) &&
+                          (selectedVisibility == 'lawyers'
+                            ? isLawyerLikeRole(m.role)
+                            : isInternLikeRole(m.role)))
+                        .toList();
+
+                          final allSelected = displayMembers.isNotEmpty &&
+                              displayMembers
+                            .every((m) => selectedMemberIds.contains(uidOf(m)));
                         return Align(
                           alignment: Alignment.centerRight,
                           child: TextButton(
                             onPressed: () {
                               setDialogState(() {
                                 if (allSelected) {
-                                  for (final m in filteredMembers) {
-                                    selectedMemberIds.remove(m.uid);
+                                    for (final m in displayMembers) {
+                                    selectedMemberIds.remove(uidOf(m));
                                   }
                                 } else {
-                                  for (final m in filteredMembers) {
-                                    selectedMemberIds.add(m.uid);
+                                    for (final m in displayMembers) {
+                                    selectedMemberIds.add(uidOf(m));
                                   }
                                 }
                               });
@@ -4314,18 +4406,20 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     const SizedBox(height: 8),
                     ...members
                         .where((m) =>
-                            m.uid != currentUser?.uid &&
-                            (m.role as String).toLowerCase() ==
-                                (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
+                            (uidOf(m) != (currentUser?.uid ?? '').trim() ||
+                                selectedMemberIds.contains(uidOf(m))) &&
+                            (selectedVisibility == 'lawyers'
+                                ? isLawyerLikeRole(m.role)
+                                : isInternLikeRole(m.role)))
                         .map((m) {
-                      final selected = selectedMemberIds.contains(m.uid);
+                      final selected = selectedMemberIds.contains(uidOf(m));
                       return GestureDetector(
                         onTap: () {
                           setDialogState(() {
                             if (selected) {
-                              selectedMemberIds.remove(m.uid);
+                              selectedMemberIds.remove(uidOf(m));
                             } else {
-                              selectedMemberIds.add(m.uid);
+                              selectedMemberIds.add(uidOf(m));
                             }
                           });
                         },
@@ -4407,12 +4501,18 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       return;
     }
 
+    final normalizedSelectedMemberIds = selectedMemberIds
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .toList();
+
     final participants = <String>{
       (task['createdBy'] ?? '').toString(),
-      ...selectedMemberIds,
+      ...normalizedSelectedMemberIds,
     }..removeWhere((id) => id.trim().isEmpty);
     final assigneeNames = members
-        .where((m) => selectedMemberIds.contains(m.uid))
+      .where((m) => normalizedSelectedMemberIds.contains(uidOf(m)))
         .map((m) => m.name)
         .toList();
 
@@ -4422,10 +4522,11 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
         'description': descriptionController.text.trim(),
         'deadline': selectedDeadline.toIso8601String(),
         'caseId': selectedCaseId,
-        'visibility': selectedVisibility,
-        'assignedJuniorIds': selectedMemberIds.toList(),
-        'assignedToIds': selectedMemberIds.toList(),
-        'assignedToId': selectedMemberIds.isEmpty ? '' : selectedMemberIds.first,
+      'visibility': selectedVisibility,
+        'assignedJuniorIds': normalizedSelectedMemberIds,
+        'assignedToIds': normalizedSelectedMemberIds,
+        'assignedToId':
+          normalizedSelectedMemberIds.isEmpty ? '' : normalizedSelectedMemberIds.first,
         'assignedToName':
             assigneeNames.isEmpty ? 'Unassigned' : assigneeNames.join(', '),
         'participantIds': participants.toList(),
@@ -4464,17 +4565,31 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       final isCompleted = _normalizeWorkStatus(t['status']) == 'completed';
       final isVisibleToUser =
           isEscalated || isOwner || isPublic || isAssigned || isParticipant;
-      return isVisibleToUser && (completed ? isCompleted : !isCompleted);
+      if (!(isVisibleToUser && (completed ? isCompleted : !isCompleted))) {
+        return false;
+      }
+
+      if (!completed) return true;
+
+      final clearedMap =
+          Map<String, dynamic>.from(t['clearedCompletedAtByUser'] ?? {});
+      final clearedAt =
+          DateTime.tryParse((clearedMap[uid] ?? '').toString());
+      if (clearedAt == null) return true;
+
+      final completedAt = DateTime.tryParse((t['completedAt'] ?? '').toString());
+      if (completedAt == null) return false;
+
+      // Respawn for user when task is completed again after being reverted.
+      return clearedAt.isBefore(completedAt);
     }).toList();
 
-    if (filtered.isEmpty) {
-      return Center(
-        child: Text(completed ? 'No completed tasks' : 'No active tasks',
-            style: TextStyle(color: Colors.grey[500])),
-      );
-    }
-
-    return ListView.builder(
+    final listBody = filtered.isEmpty
+        ? Center(
+            child: Text(completed ? 'No completed tasks' : 'No active tasks',
+                style: TextStyle(color: Colors.grey[500])),
+          )
+        : ListView.builder(
       padding: const EdgeInsets.all(20),
       itemCount: filtered.length,
       itemBuilder: (context, index) {
@@ -4488,6 +4603,10 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
         final viewedBy = List<Map<String, dynamic>>.from(
             (task['viewedBy'] as List? ?? []).map((e) =>
                 Map<String, dynamic>.from(e as Map? ?? {})));
+        final comments = List<Map<String, dynamic>>.from(
+          (task['comments'] as List? ?? []).map((e) =>
+            Map<String, dynamic>.from(e as Map? ?? {})));
+        final commentCount = comments.length;
         final iHaveViewed = viewedBy.any((v) => v['uid'] == uid);
         final isCreator = (task['createdBy'] ?? '').toString() == uid;
 
@@ -4508,6 +4627,21 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
           ),
           child: ListTile(
             contentPadding: const EdgeInsets.all(16),
+            leading: completed && _taskClearMode
+                ? Checkbox(
+                    value: _selectedCompletedTaskIds.contains(task['id']),
+                    onChanged: (_) {
+                      setState(() {
+                        final id = (task['id'] ?? '').toString();
+                        if (_selectedCompletedTaskIds.contains(id)) {
+                          _selectedCompletedTaskIds.remove(id);
+                        } else {
+                          _selectedCompletedTaskIds.add(id);
+                        }
+                      });
+                    },
+                  )
+                : null,
             title: Row(
               children: [
                 if (!isCompletedTask && isCurrentlyEscalated)
@@ -4617,6 +4751,52 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                     ),
                   ),
                 ],
+                const SizedBox(height: 8),
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: completed && _taskClearMode
+                      ? null
+                      : () => _showTaskCommentsSheet(task),
+                  child: Container(
+                    width: double.infinity,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.chat_bubble_outline,
+                            size: 14, color: Colors.blueGrey),
+                        const SizedBox(width: 6),
+                        const Text(
+                          'Comments',
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.blueGrey,
+                              fontWeight: FontWeight.w600),
+                        ),
+                        const Spacer(),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.blueGrey.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '$commentCount',
+                            style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.blueGrey,
+                                fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               ],
             ),
             trailing: PopupMenuButton<String>(
@@ -4632,23 +4812,25 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 final isAssignedToMe = assignedJuniorIds.contains(uid) ||
                     assignedToIds.contains(uid) ||
                     assignedToId == uid;
+                final canManageStatus =
+                    isCurrentlyEscalated || isAssignedToMe || isCreator;
                 if (value == 'edit') {
                   if (!isCreator) return;
                   _showEditTaskDialog(task);
                   return;
                 }
                 if (value == 'status_inProgress') {
-                  if (!(isAssignedToMe || isCreator)) return;
+                  if (!canManageStatus) return;
                   await _setTaskStatus(task, 'inProgress');
                   return;
                 }
                 if (value == 'status_completed') {
-                  if (!(isAssignedToMe || isCreator)) return;
+                  if (!canManageStatus) return;
                   await _setTaskStatus(task, 'completed');
                   return;
                 }
                 if (value == 'status_back_inProgress') {
-                  if (!(isAssignedToMe || isCreator)) return;
+                  if (!canManageStatus) return;
                   await _setTaskStatus(task, 'inProgress');
                   return;
                 }
@@ -4704,6 +4886,8 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 final isAssignedToMe = assignedJuniorIds.contains(uid) ||
                     assignedToIds.contains(uid) ||
                     assignedToId == uid;
+                final canManageStatus =
+                  isCurrentlyEscalated || isAssignedToMe || isCreator;
                 final items = <PopupMenuEntry<String>>[];
 
                 if (isCreator) {
@@ -4734,14 +4918,14 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 }
 
                 if (status == 'inProgress') {
-                  if (isAssignedToMe || isCreator) {
+                  if (canManageStatus) {
                     items.add(const PopupMenuItem<String>(
                       value: 'status_completed',
                       child: Text('Mark Completed'),
                     ));
                   }
                 } else if (status == 'completed') {
-                  if (isAssignedToMe || isCreator) {
+                  if (canManageStatus) {
                     items.add(const PopupMenuItem<String>(
                       value: 'status_back_inProgress',
                       child: Text('Mark In Progress'),
@@ -4792,10 +4976,116 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                 return items;
               },
             ),
-            onTap: () => _showTaskDetailsDialog(task),
+            onTap: () {
+              if (completed && _taskClearMode) {
+                setState(() {
+                  final id = (task['id'] ?? '').toString();
+                  if (_selectedCompletedTaskIds.contains(id)) {
+                    _selectedCompletedTaskIds.remove(id);
+                  } else {
+                    _selectedCompletedTaskIds.add(id);
+                  }
+                });
+                return;
+              }
+              _showTaskDetailsDialog(task);
+            },
           ),
         );
       },
+    );
+
+    if (!completed) return listBody;
+
+    final visibleIds = filtered
+        .map((t) => (t['id'] ?? '').toString())
+        .where((id) => id.isNotEmpty)
+        .toList();
+    final allSelected =
+        visibleIds.isNotEmpty && visibleIds.every(_selectedCompletedTaskIds.contains);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+          child: !_taskClearMode
+              ? Align(
+                  alignment: Alignment.centerRight,
+                  child: OutlinedButton.icon(
+                    onPressed: filtered.isEmpty
+                        ? null
+                        : () {
+                            setState(() {
+                              _taskClearMode = true;
+                              _selectedCompletedTaskIds.clear();
+                            });
+                          },
+                    icon: const Icon(Icons.clear_all),
+                    label: const Text('Clear Tasks'),
+                  ),
+                )
+              : Row(
+                  children: [
+                    Checkbox(
+                      value: allSelected,
+                      onChanged: (v) {
+                        setState(() {
+                          if (v == true) {
+                            _selectedCompletedTaskIds
+                              ..clear()
+                              ..addAll(visibleIds);
+                          } else {
+                            _selectedCompletedTaskIds.clear();
+                          }
+                        });
+                      },
+                    ),
+                    const Text('Select All'),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _taskClearMode = false;
+                          _selectedCompletedTaskIds.clear();
+                        });
+                      },
+                      child: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: _selectedCompletedTaskIds.isEmpty
+                          ? null
+                          : () async {
+                              final ids = _selectedCompletedTaskIds.toList();
+                              try {
+                                await ref
+                                    .read(tasksProvider.notifier)
+                                    .clearCompletedTasksForCurrentUser(ids);
+                                if (!mounted) return;
+                                setState(() {
+                                  _taskClearMode = false;
+                                  _selectedCompletedTaskIds.clear();
+                                });
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                      content: Text(
+                                          'Cleared ${ids.length} completed task(s)')),
+                                );
+                              } catch (e) {
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text('Unable to clear tasks: $e')),
+                                );
+                              }
+                            },
+                      child: const Text('Clear Selected'),
+                    ),
+                  ],
+                ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(child: listBody),
+      ],
     );
   }
 
@@ -4888,6 +5178,193 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
       ),
     );
   }
+
+  void _showTaskCommentsSheet(Map<String, dynamic> task) {
+    final controller = TextEditingController();
+    final user = ref.read(currentUserProvider);
+    var comments = List<Map<String, dynamic>>.from(
+      (task['comments'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map? ?? {})),
+    );
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final sorted = [...comments]
+              ..sort((a, b) => (a['createdAt'] ?? '')
+                  .toString()
+                  .compareTo((b['createdAt'] ?? '').toString()));
+
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              child: SafeArea(
+                child: SizedBox(
+                  height: MediaQuery.of(ctx).size.height * 0.72,
+                  child: Column(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 14, 12, 8),
+                        child: Row(
+                          children: [
+                            const Text('Comments',
+                                style: TextStyle(
+                                    fontSize: 16, fontWeight: FontWeight.w700)),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.blueGrey.withOpacity(0.15),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                '${sorted.length}',
+                                style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.blueGrey,
+                                    fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                            const Spacer(),
+                            IconButton(
+                              onPressed: () => Navigator.pop(ctx),
+                              icon: const Icon(Icons.close),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Expanded(
+                        child: sorted.isEmpty
+                            ? const Center(
+                                child: Text('No comments yet',
+                                    style: TextStyle(color: Colors.grey)),
+                              )
+                            : ListView.builder(
+                                padding: const EdgeInsets.all(12),
+                                itemCount: sorted.length,
+                                itemBuilder: (c, i) {
+                                  final cm = sorted[i];
+                                  return Container(
+                                    margin: const EdgeInsets.only(bottom: 10),
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                      color: Colors.grey.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Expanded(
+                                              child: Text(
+                                                (cm['authorName'] ?? 'Unknown User')
+                                                    .toString(),
+                                                style: const TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w700,
+                                                    color: AppColors.primary),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Text(
+                                              _formatCommentTimestamp(cm['createdAt']),
+                                              style: TextStyle(
+                                                fontSize: 10,
+                                                color: Colors.grey[600],
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text((cm['text'] ?? '').toString()),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                      ),
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: controller,
+                                maxLines: 3,
+                                minLines: 1,
+                                decoration: InputDecoration(
+                                  hintText: 'Write a comment...',
+                                  filled: true,
+                                  fillColor: Colors.grey.withOpacity(0.08),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              onPressed: () async {
+                                final text = controller.text.trim();
+                                if (text.isEmpty || user == null) return;
+                                try {
+                                  await ref.read(tasksProvider.notifier).addTaskComment(
+                                        taskId: (task['id'] ?? '').toString(),
+                                        text: text,
+                                        authorUid: user.uid,
+                                        authorName: user.name,
+                                      );
+                                  controller.clear();
+                                  setSheetState(() {
+                                    comments = [
+                                      ...comments,
+                                      {
+                                        'id':
+                                            '${DateTime.now().millisecondsSinceEpoch}_${user.uid}',
+                                        'text': text,
+                                        'authorUid': user.uid,
+                                        'authorName': user.name,
+                                        'createdAt':
+                                            DateTime.now().toIso8601String(),
+                                      }
+                                    ];
+                                  });
+                                } catch (e) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                        content:
+                                            Text('Unable to add comment: $e')),
+                                  );
+                                }
+                              },
+                              icon: const Icon(Icons.send),
+                              color: AppColors.accent,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    ).whenComplete(controller.dispose);
+  }
+
   void _showViewedByDialog(BuildContext context, List<Map<String, dynamic>> viewedBy, {required bool isTask}) {
     showDialog(
       context: context,
@@ -4939,6 +5416,8 @@ class _LawyerAssignmentsScreenState
   String _tag = 'normal';
   DateTime _deadline = DateTime.now().add(const Duration(days: 3));
   String? _selectedCaseId;
+  bool _assignmentClearMode = false;
+  final Set<String> _selectedCompletedAssignmentIds = <String>{};
 
   @override
   void initState() {
@@ -5156,11 +5635,19 @@ class _LawyerAssignmentsScreenState
               (_visibility == 'lawyers' || _visibility == 'interns'))
             members.when(
               data: (memberList) {
-                final roleFilter =
-                    _visibility == 'lawyers' ? 'lawyer' : 'intern';
+                bool isLawyerLikeRole(String role) {
+                  final r = role.toLowerCase().trim();
+                  return r == 'lawyer' || r == 'admin';
+                }
+                bool isInternLikeRole(String role) {
+                  final r = role.toLowerCase().trim();
+                  return r == 'intern' || r == 'junior' || r == 'interns';
+                }
                 final filteredMembers = memberList
                     .where((m) =>
-                        (m.role as String).toLowerCase() == roleFilter &&
+                        (_visibility == 'lawyers'
+                            ? isLawyerLikeRole(m.role)
+                            : isInternLikeRole(m.role)) &&
                         m.uid != user?.uid)
                     .toList();
 
@@ -5551,7 +6038,24 @@ class _LawyerAssignmentsScreenState
     final descriptionController =
         TextEditingController(text: assignment['description'] ?? '');
     final activeCases = ref.read(casesProvider).where((c) => !c.isClosed).toList();
-    final members = ref.read(firmMembersProvider).valueOrNull ?? [];
+    final liveMembers = ref.read(firmMembersProvider).valueOrNull ?? [];
+    final cachedMembers = ref.read(cachedFirmMembersProvider);
+    final memberByUid = <String, UserModel>{
+      for (final m in [...cachedMembers, ...liveMembers]) m.uid.trim(): m,
+    };
+    if (currentUser != null && currentUser.uid.trim().isNotEmpty) {
+      memberByUid[currentUser.uid.trim()] = currentUser;
+    }
+    final members = memberByUid.values.toList();
+    String uidOf(UserModel m) => m.uid.trim();
+    bool isLawyerLikeRole(String role) {
+      final r = role.toLowerCase().trim();
+      return r == 'lawyer' || r == 'admin';
+    }
+    bool isInternLikeRole(String role) {
+      final r = role.toLowerCase().trim();
+      return r == 'intern' || r == 'junior' || r == 'interns';
+    }
     DateTime selectedDeadline = assignment['deadline'] != null
         ? DateTime.tryParse(assignment['deadline']) ?? DateTime.now()
         : DateTime.now();
@@ -5561,10 +6065,26 @@ class _LawyerAssignmentsScreenState
       ? null
       : (assignment['caseId'] ?? '').toString();
     final selectedAssigneeIds = <String>{
-      ...List<String>.from(assignment['assignedToIds'] ?? const []),
-      ...List<String>.from(assignment['assignedJuniorIds'] ?? const []),
-      (assignment['assignedToId'] ?? '').toString(),
+      ...List<String>.from(assignment['assignedToIds'] ?? const [])
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty),
+      ...List<String>.from(assignment['assignedJuniorIds'] ?? const [])
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty),
+      (assignment['assignedToId'] ?? '').toString().trim(),
     }..removeWhere((id) => id.trim().isEmpty);
+
+    // Fallback for legacy/incomplete rows: recover assignees from participantIds.
+    final assignmentCreatorId = (assignment['createdBy'] ?? '').toString().trim();
+    final assignmentParticipantAssigneeIds =
+        List<String>.from(assignment['participantIds'] ?? const [])
+            .map((id) => id.trim())
+            .where((id) => id.isNotEmpty && id != assignmentCreatorId)
+            .where(memberByUid.containsKey)
+            .toSet();
+    if (assignmentParticipantAssigneeIds.length > selectedAssigneeIds.length) {
+      selectedAssigneeIds.addAll(assignmentParticipantAssigneeIds);
+    }
 
     // Backward-compatible fallback: if explicit assignee fields are empty,
     // treat participants (except creator/current user) as selected assignees.
@@ -5583,14 +6103,12 @@ class _LawyerAssignmentsScreenState
     // Keep existing assignees visible in the role-filtered selector.
     if (selectedVisibility == 'private' && selectedAssigneeIds.isNotEmpty) {
       final selectedMembers = members
-          .where((m) => selectedAssigneeIds.contains(m.uid))
+          .where((m) => selectedAssigneeIds.contains(uidOf(m)))
           .toList();
       final allLawyers = selectedMembers.isNotEmpty &&
-          selectedMembers.every((m) =>
-              (m.role as String).toLowerCase() == 'lawyer');
+          selectedMembers.every((m) => isLawyerLikeRole(m.role));
       final allInterns = selectedMembers.isNotEmpty &&
-          selectedMembers.every((m) =>
-              (m.role as String).toLowerCase() == 'intern');
+          selectedMembers.every((m) => isInternLikeRole(m.role));
       if (allLawyers) {
         selectedVisibility = 'lawyers';
       } else if (allInterns) {
@@ -5785,26 +6303,30 @@ class _LawyerAssignmentsScreenState
                     const SizedBox(height: 12),
                     Builder(
                       builder: (_) {
-                        final filteredMembers = members
-                            .where((m) =>
-                                m.uid != currentUser?.uid &&
-                                (m.role as String).toLowerCase() ==
-                                    (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
-                            .toList();
-                        final allSelected = filteredMembers.isNotEmpty &&
-                            filteredMembers.every((m) => selectedAssigneeIds.contains(m.uid));
+                      final displayMembers = members
+                        .where((m) =>
+                          (uidOf(m) != (currentUser?.uid ?? '').trim() ||
+                            selectedAssigneeIds.contains(uidOf(m))) &&
+                          (selectedVisibility == 'lawyers'
+                            ? isLawyerLikeRole(m.role)
+                            : isInternLikeRole(m.role)))
+                        .toList();
+
+                        final allSelected = displayMembers.isNotEmpty &&
+                            displayMembers
+                            .every((m) => selectedAssigneeIds.contains(uidOf(m)));
                         return Align(
                           alignment: Alignment.centerRight,
                           child: TextButton(
                             onPressed: () {
                               setDialogState(() {
                                 if (allSelected) {
-                                  for (final m in filteredMembers) {
-                                    selectedAssigneeIds.remove(m.uid);
+                                  for (final m in displayMembers) {
+                                    selectedAssigneeIds.remove(uidOf(m));
                                   }
                                 } else {
-                                  for (final m in filteredMembers) {
-                                    selectedAssigneeIds.add(m.uid);
+                                  for (final m in displayMembers) {
+                                    selectedAssigneeIds.add(uidOf(m));
                                   }
                                 }
                               });
@@ -5816,19 +6338,21 @@ class _LawyerAssignmentsScreenState
                     ),
                     const SizedBox(height: 8),
                     ...members
-                        .where((m) =>
-                            m.uid != currentUser?.uid &&
-                            (m.role as String).toLowerCase() ==
-                                (selectedVisibility == 'lawyers' ? 'lawyer' : 'intern'))
-                        .map((m) {
-                      final selected = selectedAssigneeIds.contains(m.uid);
+                      .where((m) =>
+                        (uidOf(m) != (currentUser?.uid ?? '').trim() ||
+                          selectedAssigneeIds.contains(uidOf(m))) &&
+                        (selectedVisibility == 'lawyers'
+                          ? isLawyerLikeRole(m.role)
+                          : isInternLikeRole(m.role)))
+                      .map((m) {
+                      final selected = selectedAssigneeIds.contains(uidOf(m));
                       return GestureDetector(
                         onTap: () {
                           setDialogState(() {
                             if (selected) {
-                              selectedAssigneeIds.remove(m.uid);
+                              selectedAssigneeIds.remove(uidOf(m));
                             } else {
-                              selectedAssigneeIds.add(m.uid);
+                              selectedAssigneeIds.add(uidOf(m));
                             }
                           });
                         },
@@ -5906,7 +6430,7 @@ class _LawyerAssignmentsScreenState
         ? <String>{(assignment['createdBy'] ?? '').toString()}
         : selectedAssigneeIds;
     final assigneeNames = members
-        .where((m) => assigneeIds.contains(m.uid))
+      .where((m) => assigneeIds.contains(uidOf(m)))
         .map((m) => m.name)
         .toList();
     final participants = <String>{
@@ -5946,6 +6470,7 @@ class _LawyerAssignmentsScreenState
   Widget _buildAssignmentListTab({required bool completed}) {
     final user = ref.watch(currentUserProvider);
     final isInternUser = user?.role == 'intern';
+    final uid = (user?.uid ?? '').toString();
     final assignments = ref
         .watch(assignmentsProvider)
         .where((a) =>
@@ -5955,22 +6480,35 @@ class _LawyerAssignmentsScreenState
         List<String>.from(a['participantIds'] ?? const [])
           .contains(user?.uid) ||
         (a['assignedToId'] ?? '').toString() == (user?.uid ?? ''))
-        .where((a) => completed
-          ? _normalizeWorkStatus(a['status']) == 'completed'
-          : _normalizeWorkStatus(a['status']) != 'completed')
+        .where((a) {
+          final isCompleted = _normalizeWorkStatus(a['status']) == 'completed';
+          if (!(completed ? isCompleted : !isCompleted)) return false;
+          if (!completed) return true;
+
+          final clearedMap =
+              Map<String, dynamic>.from(a['clearedCompletedAtByUser'] ?? {});
+          final clearedAt = DateTime.tryParse((clearedMap[uid] ?? '').toString());
+          if (clearedAt == null) return true;
+
+          final completedAt =
+              DateTime.tryParse((a['completedAt'] ?? '').toString());
+          if (completedAt == null) return false;
+
+          // Respawn for user when assignment is completed again after revert.
+          return clearedAt.isBefore(completedAt);
+        })
         .toList()
       ..sort((a, b) => (b['createdAt'] ?? '')
           .toString()
           .compareTo((a['createdAt'] ?? '').toString()));
 
-    if (assignments.isEmpty) {
-      return Center(
-          child: Text(
-              completed ? 'No completed assignments' : 'No active assignments',
-              style: const TextStyle(color: Colors.grey)));
-    }
-
-    return ListView.builder(
+    final listBody = assignments.isEmpty
+        ? Center(
+            child: Text(
+                completed ? 'No completed assignments' : 'No active assignments',
+                style: const TextStyle(color: Colors.grey)),
+          )
+        : ListView.builder(
       padding: const EdgeInsets.all(20),
       itemCount: assignments.length,
       itemBuilder: (context, index) {
@@ -5979,11 +6517,14 @@ class _LawyerAssignmentsScreenState
         final priorityRaw = a['tag'] ?? a['priority'] ?? 'normal';
         final tagColor = _assignmentPriorityColor(priorityRaw);
         final priorityLabel = _assignmentPriorityLabel(priorityRaw);
-        final uid = (user?.uid ?? '').toString();
 
         final viewedBy = List<Map<String, dynamic>>.from(
             (a['viewedBy'] as List? ?? []).map((e) =>
                 Map<String, dynamic>.from(e as Map? ?? {})));
+        final comments = List<Map<String, dynamic>>.from(
+          (a['comments'] as List? ?? []).map((e) =>
+            Map<String, dynamic>.from(e as Map? ?? {})));
+        final commentCount = comments.length;
         final iHaveViewed = viewedBy.any((v) => v['uid'] == uid);
         final isCreator = (a['createdBy'] ?? '').toString() == uid;
 
@@ -6001,6 +6542,22 @@ class _LawyerAssignmentsScreenState
           ),
           child: ListTile(
             contentPadding: const EdgeInsets.all(16),
+            leading: completed && _assignmentClearMode
+                ? Checkbox(
+                    value:
+                        _selectedCompletedAssignmentIds.contains(a['id']),
+                    onChanged: (_) {
+                      setState(() {
+                        final id = (a['id'] ?? '').toString();
+                        if (_selectedCompletedAssignmentIds.contains(id)) {
+                          _selectedCompletedAssignmentIds.remove(id);
+                        } else {
+                          _selectedCompletedAssignmentIds.add(id);
+                        }
+                      });
+                    },
+                  )
+                : null,
             title: Row(
               children: [
                 Expanded(
@@ -6111,6 +6668,52 @@ class _LawyerAssignmentsScreenState
                     ),
                   ),
                 ],
+                const SizedBox(height: 8),
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: completed && _assignmentClearMode
+                      ? null
+                      : () => _showAssignmentCommentsSheet(a),
+                  child: Container(
+                    width: double.infinity,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.chat_bubble_outline,
+                            size: 14, color: Colors.blueGrey),
+                        const SizedBox(width: 6),
+                        const Text(
+                          'Comments',
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.blueGrey,
+                              fontWeight: FontWeight.w600),
+                        ),
+                        const Spacer(),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: Colors.blueGrey.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '$commentCount',
+                            style: const TextStyle(
+                                fontSize: 11,
+                                color: Colors.blueGrey,
+                                fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               ],
             ),
             trailing: PopupMenuButton<String>(
@@ -6263,10 +6866,120 @@ class _LawyerAssignmentsScreenState
                 return items;
               },
             ),
-            onTap: () => _showAssignmentDetailsDialog(a),
+            onTap: () {
+              if (completed && _assignmentClearMode) {
+                setState(() {
+                  final id = (a['id'] ?? '').toString();
+                  if (_selectedCompletedAssignmentIds.contains(id)) {
+                    _selectedCompletedAssignmentIds.remove(id);
+                  } else {
+                    _selectedCompletedAssignmentIds.add(id);
+                  }
+                });
+                return;
+              }
+              _showAssignmentDetailsDialog(a);
+            },
           ),
         );
       },
+    );
+
+    if (!completed) return listBody;
+
+    final visibleIds = assignments
+        .map((a) => (a['id'] ?? '').toString())
+        .where((id) => id.isNotEmpty)
+        .toList();
+    final allSelected = visibleIds.isNotEmpty &&
+        visibleIds.every(_selectedCompletedAssignmentIds.contains);
+
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+          child: !_assignmentClearMode
+              ? Align(
+                  alignment: Alignment.centerRight,
+                  child: OutlinedButton.icon(
+                    onPressed: assignments.isEmpty
+                        ? null
+                        : () {
+                            setState(() {
+                              _assignmentClearMode = true;
+                              _selectedCompletedAssignmentIds.clear();
+                            });
+                          },
+                    icon: const Icon(Icons.clear_all),
+                    label: const Text('Clear Assignments'),
+                  ),
+                )
+              : Row(
+                  children: [
+                    Checkbox(
+                      value: allSelected,
+                      onChanged: (v) {
+                        setState(() {
+                          if (v == true) {
+                            _selectedCompletedAssignmentIds
+                              ..clear()
+                              ..addAll(visibleIds);
+                          } else {
+                            _selectedCompletedAssignmentIds.clear();
+                          }
+                        });
+                      },
+                    ),
+                    const Text('Select All'),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: () {
+                        setState(() {
+                          _assignmentClearMode = false;
+                          _selectedCompletedAssignmentIds.clear();
+                        });
+                      },
+                      child: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton(
+                      onPressed: _selectedCompletedAssignmentIds.isEmpty
+                          ? null
+                          : () async {
+                              final ids =
+                                  _selectedCompletedAssignmentIds.toList();
+                              try {
+                                await ref
+                                    .read(assignmentsProvider.notifier)
+                                    .clearCompletedAssignmentsForCurrentUser(
+                                        ids);
+                                if (!mounted) return;
+                                setState(() {
+                                  _assignmentClearMode = false;
+                                  _selectedCompletedAssignmentIds.clear();
+                                });
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                      content: Text(
+                                          'Cleared ${ids.length} completed assignment(s)')),
+                                );
+                              } catch (e) {
+                                if (!mounted) return;
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                      content: Text(
+                                          'Unable to clear assignments: $e')),
+                                );
+                              }
+                            },
+                      child: const Text('Clear Selected'),
+                    ),
+                  ],
+                ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(child: listBody),
+      ],
     );
   }
 
@@ -6357,6 +7070,195 @@ class _LawyerAssignmentsScreenState
         ],
       ),
     );
+  }
+
+  void _showAssignmentCommentsSheet(Map<String, dynamic> assignment) {
+    final controller = TextEditingController();
+    final user = ref.read(currentUserProvider);
+    var comments = List<Map<String, dynamic>>.from(
+      (assignment['comments'] as List? ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map? ?? {})),
+    );
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final sorted = [...comments]
+              ..sort((a, b) => (a['createdAt'] ?? '')
+                  .toString()
+                  .compareTo((b['createdAt'] ?? '').toString()));
+
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              child: SafeArea(
+                child: SizedBox(
+                  height: MediaQuery.of(ctx).size.height * 0.72,
+                  child: Column(
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 14, 12, 8),
+                        child: Row(
+                          children: [
+                            const Text('Comments',
+                                style: TextStyle(
+                                    fontSize: 16, fontWeight: FontWeight.w700)),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.blueGrey.withOpacity(0.15),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                '${sorted.length}',
+                                style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.blueGrey,
+                                    fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                            const Spacer(),
+                            IconButton(
+                              onPressed: () => Navigator.pop(ctx),
+                              icon: const Icon(Icons.close),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Expanded(
+                        child: sorted.isEmpty
+                            ? const Center(
+                                child: Text('No comments yet',
+                                    style: TextStyle(color: Colors.grey)),
+                              )
+                            : ListView.builder(
+                                padding: const EdgeInsets.all(12),
+                                itemCount: sorted.length,
+                                itemBuilder: (c, i) {
+                                  final cm = sorted[i];
+                                  return Container(
+                                    margin: const EdgeInsets.only(bottom: 10),
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                      color: Colors.grey.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(10),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Expanded(
+                                              child: Text(
+                                                (cm['authorName'] ?? 'Unknown User')
+                                                    .toString(),
+                                                style: const TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.w700,
+                                                    color: AppColors.primary),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Text(
+                                              _formatCommentTimestamp(cm['createdAt']),
+                                              style: TextStyle(
+                                                fontSize: 10,
+                                                color: Colors.grey[600],
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text((cm['text'] ?? '').toString()),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
+                      ),
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: controller,
+                                maxLines: 3,
+                                minLines: 1,
+                                decoration: InputDecoration(
+                                  hintText: 'Write a comment...',
+                                  filled: true,
+                                  fillColor: Colors.grey.withOpacity(0.08),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              onPressed: () async {
+                                final text = controller.text.trim();
+                                if (text.isEmpty || user == null) return;
+                                try {
+                                  await ref
+                                      .read(assignmentsProvider.notifier)
+                                      .addAssignmentComment(
+                                        assignmentId:
+                                            (assignment['id'] ?? '').toString(),
+                                        text: text,
+                                        authorUid: user.uid,
+                                        authorName: user.name,
+                                      );
+                                  controller.clear();
+                                  setSheetState(() {
+                                    comments = [
+                                      ...comments,
+                                      {
+                                        'id':
+                                            '${DateTime.now().millisecondsSinceEpoch}_${user.uid}',
+                                        'text': text,
+                                        'authorUid': user.uid,
+                                        'authorName': user.name,
+                                        'createdAt':
+                                            DateTime.now().toIso8601String(),
+                                      }
+                                    ];
+                                  });
+                                } catch (e) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                        content:
+                                            Text('Unable to add comment: $e')),
+                                  );
+                                }
+                              },
+                              icon: const Icon(Icons.send),
+                              color: AppColors.accent,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    ).whenComplete(controller.dispose);
   }
 
   void _showViewedByDialog(BuildContext context, List<Map<String, dynamic>> viewedBy, {required bool isTask}) {

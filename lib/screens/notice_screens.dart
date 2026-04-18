@@ -186,6 +186,238 @@ class _NoticeBoardScreenState extends ConsumerState<NoticeBoardScreen> {
   }
 }
 
+// ==================== NOTIFICATIONS SCREEN ====================
+class NotificationsScreen extends ConsumerStatefulWidget {
+  const NotificationsScreen({super.key});
+
+  @override
+  ConsumerState<NotificationsScreen> createState() =>
+      _NotificationsScreenState();
+}
+
+class _NotificationsScreenState extends ConsumerState<NotificationsScreen> {
+  String _filter = 'all';
+
+  String _categoryForType(String typeRaw) {
+    final type = typeRaw.toLowerCase().trim();
+    if (type.contains('task')) return 'task';
+    if (type.contains('assignment')) return 'assignment';
+    if (type.contains('escalation') || type.contains('escalated')) return 'escalation';
+    if (type.contains('viewed')) return 'viewed';
+    if (type.contains('comment')) return 'comment';
+    return 'other';
+  }
+
+  String _labelForType(String typeRaw) {
+    final type = typeRaw.toLowerCase().trim();
+    switch (type) {
+      case 'task_created':
+        return 'Task Created';
+      case 'task_escalated':
+        return 'Task Escalated';
+      case 'task_viewed':
+        return 'Task Viewed';
+      case 'task_comment':
+        return 'Task Comment';
+      case 'assignment_created':
+        return 'Assignment Created';
+      case 'assignment_status':
+        return 'Assignment Status';
+      case 'assignment_viewed':
+        return 'Assignment Viewed';
+      case 'assignment_comment':
+        return 'Assignment Comment';
+      default:
+        return typeRaw.trim().isEmpty ? 'Notification' : typeRaw;
+    }
+  }
+
+  String _timeAgo(dynamic createdAt) {
+    final dt = DateTime.tryParse((createdAt ?? '').toString());
+    if (dt == null) return '';
+    final d = DateTime.now().difference(dt);
+    if (d.inMinutes < 1) return 'Just now';
+    if (d.inMinutes < 60) return '${d.inMinutes}m ago';
+    if (d.inHours < 24) return '${d.inHours}h ago';
+    if (d.inDays < 7) return '${d.inDays}d ago';
+    return '${dt.day}/${dt.month}/${dt.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final notificationsAsync = ref.watch(inAppNotificationsProvider);
+
+    return Scaffold(
+      body: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 60, 20, 20),
+            color: AppColors.primary,
+            child: Row(
+              children: [
+                _buildBackButton(context),
+                const SizedBox(width: 12),
+                const Text(
+                  'Notifications',
+                  style: TextStyle(
+                    color: AppColors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          notificationsAsync.when(
+            data: (items) {
+              final filtered = items.where((n) {
+                if (_filter == 'all') return true;
+                final category = _categoryForType((n['type'] ?? '').toString());
+                return category == _filter;
+              }).toList();
+
+              return Expanded(
+                child: Column(
+                  children: [
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+                      child: Row(
+                        children: [
+                          for (final chip in const [
+                            {'key': 'all', 'label': 'All'},
+                            {'key': 'task', 'label': 'Tasks'},
+                            {'key': 'assignment', 'label': 'Assignments'},
+                            {'key': 'escalation', 'label': 'Escalations'},
+                            {'key': 'viewed', 'label': 'Viewed'},
+                            {'key': 'comment', 'label': 'Comments'},
+                          ])
+                            Padding(
+                              padding: const EdgeInsets.only(right: 8),
+                              child: ChoiceChip(
+                                label: Text(chip['label']!),
+                                selected: _filter == chip['key'],
+                                onSelected: (_) {
+                                  setState(() => _filter = chip['key']!);
+                                },
+                                selectedColor: AppColors.accent.withOpacity(0.25),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    Expanded(
+                      child: filtered.isEmpty
+                          ? Center(
+                              child: Text(
+                                'No notifications',
+                                style: TextStyle(color: Colors.grey[600]),
+                              ),
+                            )
+                          : ListView.builder(
+                              padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                              itemCount: filtered.length,
+                              itemBuilder: (context, index) {
+                                final n = filtered[index];
+                                final isRead = n['isRead'] == true;
+                                final type = (n['type'] ?? '').toString();
+                                final title = (n['title'] ?? 'Notification').toString();
+                                final body = (n['body'] ?? '').toString();
+                                final notifId = (n['id'] ?? '').toString();
+
+                                return GestureDetector(
+                                  onTap: () async {
+                                    if (!isRead && notifId.isNotEmpty) {
+                                      await ref
+                                          .read(firestoreServiceProvider)
+                                          .markNotificationRead(notifId);
+                                    }
+                                  },
+                                  child: Container(
+                                    margin: const EdgeInsets.only(bottom: 10),
+                                    padding: const EdgeInsets.all(12),
+                                    decoration: BoxDecoration(
+                                      color: isRead
+                                          ? AppColors.white
+                                          : AppColors.accent.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                        color: isRead
+                                            ? Colors.grey.withOpacity(0.2)
+                                            : AppColors.accent.withOpacity(0.45),
+                                      ),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Expanded(
+                                              child: Text(
+                                                title,
+                                                style: const TextStyle(
+                                                  fontWeight: FontWeight.w700,
+                                                  color: AppColors.text,
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 8),
+                                            Text(
+                                              _timeAgo(n['createdAt']),
+                                              style: TextStyle(
+                                                fontSize: 11,
+                                                color: Colors.grey[600],
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          _labelForType(type),
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Colors.blueGrey[700],
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        if (body.isNotEmpty) ...[
+                                          const SizedBox(height: 6),
+                                          Text(
+                                            body,
+                                            style: TextStyle(
+                                                color: Colors.grey[800],
+                                                fontSize: 13),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              );
+            },
+            loading: () => const Expanded(
+              child: Center(child: CircularProgressIndicator()),
+            ),
+            error: (e, _) => Expanded(
+              child: Center(
+                child: Text(
+                  'Unable to load notifications',
+                  style: TextStyle(color: Colors.grey[600]),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ==================== CREATE NOTICE SCREEN ====================
 class CreateNoticeScreen extends ConsumerStatefulWidget {
   const CreateNoticeScreen({super.key});

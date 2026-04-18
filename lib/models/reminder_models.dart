@@ -144,10 +144,11 @@ class Reminder {
 
   bool isVisibleToUser(String userId, {String userRole = ''}) {
     if (createdBy == userId) return true;
+    final role = userRole.toLowerCase();
     switch (visibility) {
       case ReminderVisibility.private: return false;
-      case ReminderVisibility.lawyers: return userRole.toLowerCase() == 'lawyer';
-      case ReminderVisibility.interns: return userRole.toLowerCase() == 'intern';
+      case ReminderVisibility.lawyers: return role == 'lawyer' || role == 'admin';
+      case ReminderVisibility.interns: return role == 'intern';
       case ReminderVisibility.specificUsers: return sharedWithUserIds.contains(userId);
       case ReminderVisibility.everyone: return true;
     }

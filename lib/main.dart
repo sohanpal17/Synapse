@@ -328,7 +328,7 @@ Widget _routeWidget(String routeName) {
     case '/create-notice':
       return const CreateNoticeScreen();
     case '/notifications':
-      return const NoticeBoardScreen();
+      return const NotificationsScreen();
     case '/admin-dashboard':
       return const AdminDashboardScreen();
     case '/courtroom-sos':
