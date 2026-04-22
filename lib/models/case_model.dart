@@ -33,6 +33,7 @@ class CaseModel {
   final String urgencyLevel;
 
   // ── Firm & Team ──
+  final String ownerUid;
   final List<String> assignedMemberIds;
   final List<String> clientIds;
 
@@ -63,6 +64,7 @@ class CaseModel {
     this.disposalStatus,
     required this.isClosed,
     required this.urgencyLevel,
+    this.ownerUid = '',
     this.assignedMemberIds = const [],
     this.clientIds = const [],
     this.customDocuments = const [],
@@ -126,6 +128,7 @@ class CaseModel {
         'disposalStatus': disposalStatus,
         'isClosed': isClosed,
         'urgencyLevel': urgencyLevel,
+        'ownerUid': ownerUid,
         'assignedLawyerIds': assignedMemberIds, // Keep old keys for backward sync
         'assignedInternIds': [],
         'assignedMemberIds': assignedMemberIds,
@@ -159,17 +162,34 @@ class CaseModel {
       disposalStatus: map['disposalStatus'],
       isClosed: decDate != null,
       urgencyLevel: computeUrgency(nextDate),
+      ownerUid: (map['ownerUid'] ?? '').toString(),
       assignedMemberIds: [
+        (map['ownerUid'] ?? '').toString(),
         ...List<String>.from(map['assignedMemberIds'] ?? []),
         ...List<String>.from(map['assignedLawyerIds'] ?? []),
         ...List<String>.from(map['assignedInternIds'] ?? []),
         ...List<String>.from(map['clientIds'] ?? []),
-      ].toSet().toList(),
+      ]
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty)
+          .toSet()
+          .toList(),
       clientIds: List<String>.from(map['clientIds'] ?? []),
-      customDocuments: List<Map<String, dynamic>>.from(map['customDocuments'] ?? []),
+      customDocuments: _normalizeCustomDocuments(map['customDocuments']),
       createdAt: DateFormatter.parseDate(map['createdAt']),
       updatedAt: DateFormatter.parseDate(map['updatedAt']),
     );
+  }
+
+  static List<Map<String, dynamic>> _normalizeCustomDocuments(dynamic raw) {
+    if (raw is! List) return const <Map<String, dynamic>>[];
+    final docs = <Map<String, dynamic>>[];
+    for (final item in raw) {
+      if (item is Map) {
+        docs.add(Map<String, dynamic>.from(item));
+      }
+    }
+    return docs;
   }
 
   // ══════════ eCOURTS IMPORT FACTORY ══════════
@@ -256,6 +276,7 @@ class CaseModel {
       disposalStatus: disposalStatus,
       isClosed: isClosed,
       urgencyLevel: CaseModel.computeUrgency(nd),
+      ownerUid: ownerUid,
       assignedMemberIds: assignedMemberIds ?? this.assignedMemberIds,
       clientIds: clientIds ?? this.clientIds,
       customDocuments: customDocuments ?? this.customDocuments,

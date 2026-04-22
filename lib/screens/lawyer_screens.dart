@@ -24,6 +24,7 @@ import '../services/firestore_service.dart';
 
 const _uuid = Uuid();
 const int _maxUploadBytes = 25 * 1024 * 1024;
+const Duration _completedItemRetention = Duration(hours: 6);
 
 String _normalizeWorkStatus(dynamic raw) {
   final status = (raw ?? '').toString().trim().toLowerCase();
@@ -39,7 +40,21 @@ String _normalizeWorkStatus(dynamic raw) {
 String _formatCommentTimestamp(dynamic raw) {
   final dt = DateFormatter.parseDateNullable(raw);
   if (dt == null) return 'Unknown time';
-  return DateFormat('dd MMM yyyy, h:mm a').format(dt);
+  // Render comments in fixed Indian Standard Time (UTC+05:30).
+  final ist = (dt.isUtc ? dt : dt.toUtc()).add(const Duration(hours: 5, minutes: 30));
+  return '${DateFormat('dd MMM yyyy, h:mm a').format(ist)} IST';
+}
+
+bool _isExpiredCompletedWorkItem(Map<String, dynamic> item) {
+  if (_normalizeWorkStatus(item['status']) != 'completed') return false;
+  final completedAt = DateFormatter.parseDateNullable(item['completedAt']) ??
+      DateFormatter.parseDateNullable(item['updatedAt']) ??
+      DateFormatter.parseDateNullable(item['deadline']) ??
+      DateFormatter.parseDateNullable(item['assignedAt']) ??
+      DateFormatter.parseDateNullable(item['createdAt']);
+  if (completedAt == null) return false;
+  final cutoff = DateTime.now().subtract(_completedItemRetention);
+  return completedAt.isBefore(cutoff);
 }
 
 // ==================== LAWYER DASHBOARD ====================
@@ -1037,9 +1052,14 @@ class _ManageCaseMembersSheetState
           Expanded(
             child: membersAsync.when(
               data: (members) {
-                final validMembers = members
-                    .where((m) => m.uid != user?.uid)
-                    .toList();
+                final mergedMembers = [...members];
+                if (user != null &&
+                    user.uid.trim().isNotEmpty &&
+                    user.role.toLowerCase().trim() != 'client' &&
+                    !mergedMembers.any((m) => m.uid == user.uid)) {
+                  mergedMembers.add(user);
+                }
+                final validMembers = mergedMembers;
 
                 if (validMembers.isEmpty) {
                   return const Center(child: Text('No firm members found.'));
@@ -2471,15 +2491,21 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                   onSelected: (value) async {
                     final isCreator = (task['createdBy'] ?? '').toString() ==
                         (currentUser?.uid ?? '');
-                    final uid = (currentUser?.uid ?? '').toString();
-                    final assignedJuniorIds =
-                        List<String>.from(task['assignedJuniorIds'] ?? const []);
-                    final assignedToIds =
-                        List<String>.from(task['assignedToIds'] ?? const []);
-                    final assignedToId = (task['assignedToId'] ?? '').toString();
-                    final isAssignedToMe = assignedJuniorIds.contains(uid) ||
-                        assignedToIds.contains(uid) ||
-                        assignedToId == uid;
+                  final uid = (currentUser?.uid ?? '').toString().trim();
+                  final creatorUid = (task['createdBy'] ?? '').toString().trim();
+                  final taskAssigneeIds = {
+                    ...List<String>.from(task['assignedJuniorIds'] ?? const [])
+                      .map((id) => id.trim())
+                      .where((id) => id.isNotEmpty),
+                    ...List<String>.from(task['assignedToIds'] ?? const [])
+                      .map((id) => id.trim())
+                      .where((id) => id.isNotEmpty),
+                    (task['assignedToId'] ?? '').toString().trim(),
+                    ...List<String>.from(task['participantIds'] ?? const [])
+                      .map((id) => id.trim())
+                      .where((id) => id.isNotEmpty && id != creatorUid),
+                  }..remove('');
+                  final isAssignedToMe = taskAssigneeIds.contains(uid);
                     final canManageStatus =
                         isEscalated || isAssignedToMe || isCreator;
                     if (value == 'edit') {
@@ -2516,15 +2542,21 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                   itemBuilder: (ctx) {
                     final isCreator = (task['createdBy'] ?? '').toString() ==
                         (currentUser?.uid ?? '');
-                    final uid = (currentUser?.uid ?? '').toString();
-                    final assignedJuniorIds =
-                        List<String>.from(task['assignedJuniorIds'] ?? const []);
-                    final assignedToIds =
-                        List<String>.from(task['assignedToIds'] ?? const []);
-                    final assignedToId = (task['assignedToId'] ?? '').toString();
-                    final isAssignedToMe = assignedJuniorIds.contains(uid) ||
-                        assignedToIds.contains(uid) ||
-                        assignedToId == uid;
+                    final uid = (currentUser?.uid ?? '').toString().trim();
+                    final creatorUid = (task['createdBy'] ?? '').toString().trim();
+                    final taskAssigneeIds = {
+                      ...List<String>.from(task['assignedJuniorIds'] ?? const [])
+                        .map((id) => id.trim())
+                        .where((id) => id.isNotEmpty),
+                      ...List<String>.from(task['assignedToIds'] ?? const [])
+                        .map((id) => id.trim())
+                        .where((id) => id.isNotEmpty),
+                      (task['assignedToId'] ?? '').toString().trim(),
+                      ...List<String>.from(task['participantIds'] ?? const [])
+                        .map((id) => id.trim())
+                        .where((id) => id.isNotEmpty && id != creatorUid),
+                    }..remove('');
+                    final isAssignedToMe = taskAssigneeIds.contains(uid);
                     final canManageStatus =
                       isEscalated || isAssignedToMe || isCreator;
                     final status = _normalizeWorkStatus(task['status']);
@@ -2547,6 +2579,13 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                       if (canManageStatus) {
                         items.add(const PopupMenuItem<String>(
                           value: 'status_back_inProgress',
+                          child: Text('Mark In Progress'),
+                        ));
+                      }
+                    } else {
+                      if (canManageStatus) {
+                        items.add(const PopupMenuItem<String>(
+                          value: 'status_inProgress',
                           child: Text('Mark In Progress'),
                         ));
                       }
@@ -2766,11 +2805,18 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
   }
 
   Widget _buildDocumentsTab(CaseModel c) {
+    final latestCase = ref
+        .watch(casesProvider)
+        .where((cc) => cc.cino == c.cino)
+        .firstOrNull ??
+        c;
+    final docs = latestCase.customDocuments;
+
     return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
       child: Column(
         children: [
-          if (c.customDocuments.isEmpty)
+          if (docs.isEmpty)
             Center(
               child: Text(
                 'Documents will appear here\nafter upload.',
@@ -2780,7 +2826,7 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
             )
           else
             Column(
-              children: c.customDocuments.map((doc) {
+              children: docs.map((doc) {
                 final isPdf = doc['type'] == 'pdf';
                 final isDoc = doc['type'] == 'doc';
 
@@ -2829,29 +2875,41 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
                             ],
                           ),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.download,
-                              color: AppColors.primary),
-                          onPressed: () async {
-                            final rawUrl = (doc['url'] as String? ?? '').trim();
-                            final uri = Uri.tryParse(rawUrl);
-                            if (uri == null) {
-                              if (!mounted) return;
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                    content: Text('Invalid document URL.')),
-                              );
-                              return;
-                            }
-                            final opened = await launchUrl(uri,
-                                mode: LaunchMode.platformDefault);
-                            if (!opened && mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                const SnackBar(
-                                    content: Text('Could not open document.')),
-                              );
-                            }
-                          },
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.download,
+                                  color: AppColors.primary),
+                              onPressed: () async {
+                                final rawUrl = (doc['url'] as String? ?? '').trim();
+                                final uri = Uri.tryParse(rawUrl);
+                                if (uri == null) {
+                                  if (!mounted) return;
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                        content: Text('Invalid document URL.')),
+                                  );
+                                  return;
+                                }
+                                final opened = await launchUrl(uri,
+                                    mode: LaunchMode.platformDefault);
+                                if (!opened && mounted) {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                        content: Text('Could not open document.')),
+                                  );
+                                }
+                              },
+                            ),
+                            if (!latestCase.isClosed)
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline,
+                                    color: Colors.redAccent),
+                                tooltip: 'Delete document',
+                                onPressed: () => _deleteCaseDocument(latestCase, doc),
+                              ),
+                          ],
                         ),
                       ],
                     ),
@@ -2861,7 +2919,7 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
             ),
 
           const SizedBox(height: 20),
-          if (!c.isClosed)
+          if (!latestCase.isClosed)
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
@@ -2890,6 +2948,75 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
         return _ManageCaseMembersSheet(caseModel: c);
       },
     );
+  }
+
+  Future<void> _deleteCaseDocument(
+    CaseModel c,
+    Map<String, dynamic> doc,
+  ) async {
+    final docName = (doc['name'] ?? 'this document').toString();
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Document'),
+        content: Text('Delete $docName from this case?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    final docId = (doc['id'] ?? '').toString();
+    final docUrl = (doc['url'] ?? '').toString();
+    try {
+      final latest = ref
+              .read(casesProvider)
+              .where((cc) => cc.cino == c.cino)
+              .firstOrNull ??
+          c;
+      final updatedDocs = List<Map<String, dynamic>>.from(latest.customDocuments)
+        ..removeWhere((d) {
+          final id = (d['id'] ?? '').toString();
+          final url = (d['url'] ?? '').toString();
+          if (docId.isNotEmpty && id == docId) return true;
+          if (docUrl.isNotEmpty && url == docUrl) return true;
+          return false;
+        });
+
+      await ref.read(casesProvider.notifier).updateCase(
+        c.cino,
+        {'customDocuments': updatedDocs},
+        queueSync: false,
+      );
+
+      // Best-effort backend delete; local UI should still be updated immediately.
+      try {
+        await ref.read(firestoreServiceProvider).deleteCaseDocument(
+              cino: c.cino,
+              documentId: docId,
+              documentUrl: docUrl,
+            );
+      } catch (_) {}
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Document deleted')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unable to delete document: $e')),
+      );
+    }
   }
 
   void _showUploadDocumentSheet(BuildContext context, CaseModel c) {
@@ -2989,27 +3116,49 @@ class _CaseDetailScreenState extends ConsumerState<CaseDetailScreen>
       );
 
       final url = await refStorage.getDownloadURL();
+      final uploadedDoc = <String, dynamic>{
+        'id': DateTime.now().millisecondsSinceEpoch.toString(),
+        'name': file.name,
+        'type': type,
+        'url': url,
+        'size': file.size,
+        'uploadedAt': DateTime.now().toIso8601String(),
+      };
+
+      var callableFailed = false;
+      try {
+        await ref.read(firestoreServiceProvider).appendCaseDocument(
+          cino: c.cino,
+          document: uploadedDoc,
+        );
+      } catch (_) {
+        // Keep local visibility even if callable deployment/network is lagging.
+        callableFailed = true;
+      }
+
       final cases = ref.read(casesProvider);
       final latest = cases.where((cc) => cc.cino == c.cino).firstOrNull ?? c;
       final updatedDocs =
           List<Map<String, dynamic>>.from(latest.customDocuments)
-            ..add({
-              'id': DateTime.now().millisecondsSinceEpoch.toString(),
-              'name': file.name,
-              'type': type,
-              'url': url,
-              'size': file.size,
-              'uploadedAt': DateTime.now().toIso8601String(),
-            });
+            ..removeWhere((d) => (d['url'] ?? '').toString() == url)
+            ..add(uploadedDoc);
 
       await ref.read(casesProvider.notifier).updateCase(c.cino, {
         'customDocuments': updatedDocs,
-      });
+      }, queueSync: false);
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Uploaded ${file.name}')),
-      );
+      if (callableFailed) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+              content: Text(
+                  'Uploaded ${file.name}. Visible locally; cloud sync will complete after functions deploy/network recovery.')),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Uploaded ${file.name}')),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       final err = e.toString();
@@ -4549,6 +4698,8 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
     final isInternUser = user?.role == 'intern';
     final allTasks = ref.watch(tasksProvider);
     final filtered = allTasks.where((t) {
+      if (_isExpiredCompletedWorkItem(t)) return false;
+
       final uid = user?.uid ?? '';
       final assigned = List<String>.from(t['assignedJuniorIds'] ?? const []);
       final assignedMany = List<String>.from(t['assignedToIds'] ?? const []);
@@ -4803,15 +4954,21 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
               onSelected: (value) async {
                 final isCreator =
                     (task['createdBy'] ?? '').toString() == (user?.uid ?? '');
-                final uid = (user?.uid ?? '').toString();
-                final assignedJuniorIds =
-                    List<String>.from(task['assignedJuniorIds'] ?? const []);
-                final assignedToIds =
-                    List<String>.from(task['assignedToIds'] ?? const []);
-                final assignedToId = (task['assignedToId'] ?? '').toString();
-                final isAssignedToMe = assignedJuniorIds.contains(uid) ||
-                    assignedToIds.contains(uid) ||
-                    assignedToId == uid;
+              final uid = (user?.uid ?? '').toString().trim();
+              final creatorUid = (task['createdBy'] ?? '').toString().trim();
+              final taskAssigneeIds = {
+                ...List<String>.from(task['assignedJuniorIds'] ?? const [])
+                  .map((id) => id.trim())
+                  .where((id) => id.isNotEmpty),
+                ...List<String>.from(task['assignedToIds'] ?? const [])
+                  .map((id) => id.trim())
+                  .where((id) => id.isNotEmpty),
+                (task['assignedToId'] ?? '').toString().trim(),
+                ...List<String>.from(task['participantIds'] ?? const [])
+                  .map((id) => id.trim())
+                  .where((id) => id.isNotEmpty && id != creatorUid),
+              }..remove('');
+              final isAssignedToMe = taskAssigneeIds.contains(uid);
                 final canManageStatus =
                     isCurrentlyEscalated || isAssignedToMe || isCreator;
                 if (value == 'edit') {
@@ -4875,17 +5032,23 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
               },
               itemBuilder: (ctx) {
                 final status = _normalizeWorkStatus(task['status']);
-                final uid = (user?.uid ?? '').toString();
+                final uid = (user?.uid ?? '').toString().trim();
                 final isCreator =
-                    (task['createdBy'] ?? '').toString() == uid;
-                final assignedJuniorIds =
-                    List<String>.from(task['assignedJuniorIds'] ?? const []);
-                final assignedToIds =
-                    List<String>.from(task['assignedToIds'] ?? const []);
-                final assignedToId = (task['assignedToId'] ?? '').toString();
-                final isAssignedToMe = assignedJuniorIds.contains(uid) ||
-                    assignedToIds.contains(uid) ||
-                    assignedToId == uid;
+                  (task['createdBy'] ?? '').toString().trim() == uid;
+                final creatorUid = (task['createdBy'] ?? '').toString().trim();
+                final taskAssigneeIds = {
+                  ...List<String>.from(task['assignedJuniorIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  ...List<String>.from(task['assignedToIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  (task['assignedToId'] ?? '').toString().trim(),
+                  ...List<String>.from(task['participantIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty && id != creatorUid),
+                }..remove('');
+                final isAssignedToMe = taskAssigneeIds.contains(uid);
                 final canManageStatus =
                   isCurrentlyEscalated || isAssignedToMe || isCreator;
                 final items = <PopupMenuEntry<String>>[];
@@ -4928,6 +5091,13 @@ class _LawyerTasksScreenState extends ConsumerState<LawyerTasksScreen>
                   if (canManageStatus) {
                     items.add(const PopupMenuItem<String>(
                       value: 'status_back_inProgress',
+                      child: Text('Mark In Progress'),
+                    ));
+                  }
+                } else {
+                  if (canManageStatus) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_inProgress',
                       child: Text('Mark In Progress'),
                     ));
                   }
@@ -6473,6 +6643,7 @@ class _LawyerAssignmentsScreenState
     final uid = (user?.uid ?? '').toString();
     final assignments = ref
         .watch(assignmentsProvider)
+      .where((a) => !_isExpiredCompletedWorkItem(a))
         .where((a) =>
             a['createdBy'] == user?.uid ||
         List<String>.from(a['assignedToIds'] ?? const [])
@@ -6722,14 +6893,23 @@ class _LawyerAssignmentsScreenState
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
               onSelected: (value) async {
-                final isCreator = (a['createdBy'] ?? '').toString() ==
-                    (user?.uid ?? '');
-                final uid = (user?.uid ?? '').toString();
-                final assignedToIds =
-                    List<String>.from(a['assignedToIds'] ?? const []);
-                final assignedToId = (a['assignedToId'] ?? '').toString();
-                final isAssignedToMe =
-                    assignedToIds.contains(uid) || assignedToId == uid;
+                final isCreator = (a['createdBy'] ?? '').toString().trim() ==
+                    (user?.uid ?? '').toString().trim();
+                final uid = (user?.uid ?? '').toString().trim();
+                final creatorUid = (a['createdBy'] ?? '').toString().trim();
+                final assignmentAssigneeIds = {
+                  ...List<String>.from(a['assignedToIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  ...List<String>.from(a['assignedJuniorIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  (a['assignedToId'] ?? '').toString().trim(),
+                  ...List<String>.from(a['participantIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty && id != creatorUid),
+                }..remove('');
+                final isAssignedToMe = assignmentAssigneeIds.contains(uid);
                 if (value == 'edit') {
                   if (!isCreator) return;
                   _showEditAssignmentDialog(a);
@@ -6787,14 +6967,23 @@ class _LawyerAssignmentsScreenState
               },
               itemBuilder: (ctx) {
                 final status = _normalizeWorkStatus(a['status']);
-                final uid = (user?.uid ?? '').toString();
-                final isCreator = (a['createdBy'] ?? '').toString() ==
+                final uid = (user?.uid ?? '').toString().trim();
+                final isCreator = (a['createdBy'] ?? '').toString().trim() ==
                     uid;
-                final assignedToIds =
-                    List<String>.from(a['assignedToIds'] ?? const []);
-                final assignedToId = (a['assignedToId'] ?? '').toString();
-                final isAssignedToMe =
-                    assignedToIds.contains(uid) || assignedToId == uid;
+                final creatorUid = (a['createdBy'] ?? '').toString().trim();
+                final assignmentAssigneeIds = {
+                  ...List<String>.from(a['assignedToIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  ...List<String>.from(a['assignedJuniorIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty),
+                  (a['assignedToId'] ?? '').toString().trim(),
+                  ...List<String>.from(a['participantIds'] ?? const [])
+                    .map((id) => id.trim())
+                    .where((id) => id.isNotEmpty && id != creatorUid),
+                }..remove('');
+                final isAssignedToMe = assignmentAssigneeIds.contains(uid);
                 final items = <PopupMenuEntry<String>>[];
 
                 // Creator-only: "Viewed by" to open who has seen the assignment
@@ -6836,6 +7025,13 @@ class _LawyerAssignmentsScreenState
                   if (isAssignedToMe || isCreator) {
                     items.add(const PopupMenuItem<String>(
                       value: 'status_back_inProgress',
+                      child: Text('Mark In Progress'),
+                    ));
+                  }
+                } else {
+                  if (isAssignedToMe || isCreator) {
+                    items.add(const PopupMenuItem<String>(
+                      value: 'status_inProgress',
                       child: Text('Mark In Progress'),
                     ));
                   }

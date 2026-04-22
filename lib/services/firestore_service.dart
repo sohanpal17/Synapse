@@ -243,6 +243,30 @@ class FirestoreService {
     });
   }
 
+  /// Append a document entry to a case via callable (owner/participant/admin).
+  Future<void> appendCaseDocument({
+    required String cino,
+    required Map<String, dynamic> document,
+  }) async {
+    await _functions.httpsCallable('appendCaseDocument').call({
+      'cino': cino,
+      'document': document,
+    });
+  }
+
+  /// Delete a document entry from a case via callable (owner/participant/admin).
+  Future<void> deleteCaseDocument({
+    required String cino,
+    String? documentId,
+    String? documentUrl,
+  }) async {
+    await _functions.httpsCallable('deleteCaseDocument').call({
+      'cino': cino,
+      'documentId': documentId ?? '',
+      'documentUrl': documentUrl ?? '',
+    });
+  }
+
   // ══════════════════════════════════════
   //                TASKS
   // ══════════════════════════════════════

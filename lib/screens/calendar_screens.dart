@@ -430,11 +430,19 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
           ? 'lawyer'
           : 'intern';
       final roleMemberIds = _memberIdsForRole(members, targetRole);
+      final internalMemberIds = {
+        ..._memberIdsForRole(members, 'lawyer'),
+        ..._memberIdsForRole(members, 'intern'),
+      };
 
       // If nothing was specifically selected, default to all members of that role.
       if (finalSelectedUserIds.isEmpty) {
         finalSelectedUserIds = roleMemberIds.toSet();
       }
+
+      // Keep only valid internal members and preserve mixed-role selections.
+      finalSelectedUserIds =
+          finalSelectedUserIds.where(internalMemberIds.contains).toSet();
 
       if (finalSelectedUserIds.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -449,7 +457,8 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
         return;
       }
 
-      finalSelectedUserIds = roleMemberIds.toSet();
+      // Role-based picker stores explicit recipients.
+      finalVisibility = ReminderVisibility.specificUsers;
     }
 
     // Combine date and time
@@ -753,11 +762,14 @@ class _CreateReminderScreenState extends ConsumerState<CreateReminderScreen> {
                                     onChanged: (value) {
                                       setState(() {
                                         _selectAll = value ?? false;
+                                        final roleMemberIds =
+                                            roleMembers.map((m) => m.uid).toSet();
                                         if (_selectAll) {
-                                          _selectedUserIds =
-                                              roleMembers.map((m) => m.uid).toSet();
+                                          _selectedUserIds.addAll(roleMemberIds);
                                         } else {
-                                          _selectedUserIds.clear();
+                                          _selectedUserIds.removeWhere(
+                                            (id) => roleMemberIds.contains(id),
+                                          );
                                         }
                                       });
                                     },

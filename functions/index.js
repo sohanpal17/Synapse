@@ -870,6 +870,183 @@ exports.updateCaseTeamMembers = functions
     };
   });
 
+exports.appendCaseDocument = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const cino = String((data && data.cino) || '').trim();
+    const document = data && typeof data.document === 'object' && data.document ? data.document : null;
+    if (!cino || !document) {
+      throw new functions.https.HttpsError('invalid-argument', 'cino and document are required.');
+    }
+
+    const callerDoc = await db.collection('users').doc(callerUid).get();
+    const callerRole = String((callerDoc.exists ? callerDoc.data() || {} : {}).role || '').toLowerCase();
+    const isCallerAdmin = callerRole === 'admin';
+
+    const snap = await db.collection('cases').where('cino', '==', cino).limit(20).get();
+    if (snap.empty) {
+      throw new functions.https.HttpsError('not-found', 'Case not found.');
+    }
+
+    const targetDoc = snap.docs.find((doc) => {
+      const d = doc.data() || {};
+      const participants = uniqueNonEmptyStrings(d.participantIds || []);
+      const assignedMembers = uniqueNonEmptyStrings(d.assignedMemberIds || []);
+      const ownerUid = String(d.ownerUid || '').trim();
+      return (
+        isCallerAdmin ||
+        ownerUid === callerUid ||
+        participants.includes(callerUid) ||
+        assignedMembers.includes(callerUid)
+      );
+    });
+
+    if (!targetDoc) {
+      throw new functions.https.HttpsError('permission-denied', 'Not allowed to upload documents for this case.');
+    }
+
+    const existing = targetDoc.data() || {};
+    const existingDocs = Array.isArray(existing.customDocuments) ? existing.customDocuments : [];
+    const now = new Date().toISOString();
+    const entry = {
+      id: String(document.id || `${Date.now()}_${callerUid}`),
+      name: String(document.name || 'Document'),
+      type: String(document.type || 'file'),
+      url: String(document.url || ''),
+      size: Number(document.size || 0),
+      uploadedAt: String(document.uploadedAt || now),
+      uploadedBy: callerUid,
+    };
+
+    if (!entry.url) {
+      throw new functions.https.HttpsError('invalid-argument', 'document.url is required.');
+    }
+
+    const mergedDocs = [
+      ...existingDocs.filter((d) => String((d && d.url) || '') !== entry.url),
+      entry,
+    ];
+
+    await targetDoc.ref.set(
+      {
+        customDocuments: mergedDocs,
+        updatedAt: now,
+      },
+      {merge: true}
+    );
+
+    return {
+      ok: true,
+      cino,
+      caseDocId: targetDoc.id,
+      documentCount: mergedDocs.length,
+    };
+  });
+
+exports.deleteCaseDocument = functions
+  .region('asia-south1')
+  .https.onCall(async (data, context) => {
+    const callerUid = context.auth && context.auth.uid ? context.auth.uid : '';
+    if (!callerUid) {
+      throw new functions.https.HttpsError('unauthenticated', 'Authentication required.');
+    }
+
+    const cino = String((data && data.cino) || '').trim();
+    const documentId = String((data && data.documentId) || '').trim();
+    const documentUrl = String((data && data.documentUrl) || '').trim();
+    if (!cino || (!documentId && !documentUrl)) {
+      throw new functions.https.HttpsError(
+        'invalid-argument',
+        'cino and at least one of documentId/documentUrl are required.'
+      );
+    }
+
+    const callerDoc = await db.collection('users').doc(callerUid).get();
+    const callerRole = String((callerDoc.exists ? callerDoc.data() || {} : {}).role || '').toLowerCase();
+    const isCallerAdmin = callerRole === 'admin';
+
+    const snap = await db.collection('cases').where('cino', '==', cino).limit(20).get();
+    if (snap.empty) {
+      throw new functions.https.HttpsError('not-found', 'Case not found.');
+    }
+
+    const targetDoc = snap.docs.find((doc) => {
+      const d = doc.data() || {};
+      const participants = uniqueNonEmptyStrings(d.participantIds || []);
+      const assignedMembers = uniqueNonEmptyStrings(d.assignedMemberIds || []);
+      const ownerUid = String(d.ownerUid || '').trim();
+      return (
+        isCallerAdmin ||
+        ownerUid === callerUid ||
+        participants.includes(callerUid) ||
+        assignedMembers.includes(callerUid)
+      );
+    });
+
+    if (!targetDoc) {
+      throw new functions.https.HttpsError('permission-denied', 'Not allowed to delete documents for this case.');
+    }
+
+    const existing = targetDoc.data() || {};
+    const existingDocs = Array.isArray(existing.customDocuments) ? existing.customDocuments : [];
+    const matched = existingDocs.find((d) => {
+      const id = String((d && d.id) || '').trim();
+      const url = String((d && d.url) || '').trim();
+      return (documentId && id === documentId) || (documentUrl && url === documentUrl);
+    });
+
+    if (!matched) {
+      return {ok: true, cino, caseDocId: targetDoc.id, removed: false, documentCount: existingDocs.length};
+    }
+
+    const matchedId = String((matched && matched.id) || '').trim();
+    const matchedUrl = String((matched && matched.url) || '').trim();
+
+    const mergedDocs = existingDocs.filter((d) => {
+      const id = String((d && d.id) || '').trim();
+      const url = String((d && d.url) || '').trim();
+      if (matchedId && id === matchedId) return false;
+      if (matchedUrl && url === matchedUrl) return false;
+      return true;
+    });
+
+    const now = new Date().toISOString();
+    await targetDoc.ref.set(
+      {
+        customDocuments: mergedDocs,
+        updatedAt: now,
+      },
+      {merge: true}
+    );
+
+    const bucket = admin.storage().bucket();
+    const filePath = storagePathFromUrl(matchedUrl, bucket.name);
+    if (filePath) {
+      try {
+        await bucket.file(filePath).delete({ignoreNotFound: true});
+      } catch (e) {
+        functions.logger.warn('Failed deleting case document file', {
+          cino,
+          filePath,
+          error: String(e),
+        });
+      }
+    }
+
+    return {
+      ok: true,
+      cino,
+      caseDocId: targetDoc.id,
+      removed: true,
+      documentCount: mergedDocs.length,
+    };
+  });
+
 async function sendModerationOutcomeNotification({targetUid, action, targetName = ''}) {
   if (!targetUid || (action !== 'approve' && action !== 'reject')) return;
 
@@ -1449,6 +1626,7 @@ exports.markTaskViewed = functions
     const isAssigned = uniqueNonEmptyStrings([
       ...(Array.isArray(task.assignedJuniorIds) ? task.assignedJuniorIds : []),
       ...(Array.isArray(task.assignedToIds) ? task.assignedToIds : []),
+      ...(Array.isArray(task.participantIds) ? task.participantIds : []),
       String(task.assignedToId || ''),
     ]).includes(callerUid);
 
@@ -1714,6 +1892,8 @@ exports.updateAssignmentAssignableFields = functions
     const isCreator = String(assignment.createdBy || '') === callerUid;
     const isAssigned = uniqueNonEmptyStrings([
       ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      ...(Array.isArray(assignment.assignedJuniorIds) ? assignment.assignedJuniorIds : []),
+      ...(Array.isArray(assignment.participantIds) ? assignment.participantIds : []),
       String(assignment.assignedToId || ''),
     ]).includes(callerUid);
 
@@ -1765,6 +1945,8 @@ exports.markAssignmentViewed = functions
     const creatorUid = String(assignment.createdBy || '');
     const isAssigned = uniqueNonEmptyStrings([
       ...(Array.isArray(assignment.assignedToIds) ? assignment.assignedToIds : []),
+      ...(Array.isArray(assignment.assignedJuniorIds) ? assignment.assignedJuniorIds : []),
+      ...(Array.isArray(assignment.participantIds) ? assignment.participantIds : []),
       String(assignment.assignedToId || ''),
     ]).includes(callerUid);
 

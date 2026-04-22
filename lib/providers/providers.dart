@@ -45,9 +45,9 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
   final AuthService _authService;
   StreamSubscription<User?>? _authSub;
   StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _profileSub;
+  String _lastAuthUid = FirebaseAuth.instance.currentUser?.uid ?? '';
 
   CurrentUserNotifier(this._authService) : super(null) {
-    _loadCachedUser();
     _authSub = FirebaseAuth.instance.authStateChanges().listen(_handleAuthChanged);
   }
 
@@ -65,14 +65,16 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
     await _profileSub?.cancel();
     _profileSub = null;
 
+    final nextUid = fbUser?.uid ?? '';
+    if (_lastAuthUid != nextUid) {
+      // Hard reset local cache on account transitions to prevent stale profile/work flicker.
+      await HiveService.clearAllData();
+    }
+    _lastAuthUid = nextUid;
+
     if (fbUser == null) {
       state = null;
       return;
-    }
-
-    final cached = _authService.getCachedUser();
-    if (cached != null && cached.uid == fbUser.uid) {
-      state = cached;
     }
 
     // Keep profile in sync so pending/approved transitions are reflected live.
@@ -105,7 +107,7 @@ class CurrentUserNotifier extends StateNotifier<UserModel?> {
     }
 
     // Do not force sign-out here. Registration writes may still be in progress.
-    // Keep current state (cached or null) and let profile stream resolve.
+    // Keep current state null and let profile stream resolve.
   }
 
   void setUser(UserModel user) => state = user;
@@ -223,7 +225,20 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
       for (final c in cases) {
         final cino = (c['cino'] as String? ?? '').trim();
         if (cino.isEmpty) continue;
-        writes.add(HiveService.put(HiveService.casesBox, cino, c));
+        final incoming = Map<String, dynamic>.from(c);
+        final local = HiveService.get(HiveService.casesBox, cino);
+        if (local != null) {
+          final localDocs = List<Map<String, dynamic>>.from(
+            local['customDocuments'] ?? const [],
+          );
+          final incomingDocs = List<Map<String, dynamic>>.from(
+            incoming['customDocuments'] ?? const [],
+          );
+          if (localDocs.length > incomingDocs.length) {
+            incoming['customDocuments'] = localDocs;
+          }
+        }
+        writes.add(HiveService.put(HiveService.casesBox, cino, incoming));
       }
       if (writes.isNotEmpty) {
         await Future.wait(writes);
@@ -242,18 +257,34 @@ class CasesNotifier extends StateNotifier<List<CaseModel>> {
     Map<String, dynamic> updates, {
     bool queueSync = true,
   }) async {
-    final existing = HiveService.get(HiveService.casesBox, cino);
+    final trimmedCino = cino.trim();
+    Map<String, dynamic>? existing =
+        HiveService.get(HiveService.casesBox, trimmedCino);
+    var targetKey = trimmedCino;
+
+    if (existing == null && trimmedCino.isNotEmpty) {
+      final allByKey = HiveService.getAllAsMap(HiveService.casesBox);
+      for (final entry in allByKey.entries) {
+        final mapCino = (entry.value['cino'] ?? '').toString().trim();
+        if (mapCino == trimmedCino) {
+          targetKey = entry.key;
+          existing = Map<String, dynamic>.from(entry.value);
+          break;
+        }
+      }
+    }
+
     if (existing != null) {
       existing['ownerUid'] = _currentUid;
       existing.addAll(updates);
       existing['participantIds'] = _computeCaseParticipants(existing);
       existing['updatedAt'] = DateTime.now().toIso8601String();
-      await HiveService.put(HiveService.casesBox, cino, existing);
+      await HiveService.put(HiveService.casesBox, targetKey, existing);
       if (queueSync) {
         await SyncService.queueAction(
           action: 'UPDATE',
           collection: 'cases',
-          documentId: cino,
+          documentId: targetKey,
           data: existing,
         );
       }
@@ -309,8 +340,50 @@ final tasksProvider =
 class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
   StreamSubscription? _sub;
   StreamSubscription<User?>? _authSub;
+  static const Duration _staleEscalatedRetention = Duration(days: 30);
+  static const Duration _pendingCreateRetention = Duration(hours: 12);
+  static const Duration _completedRetention = Duration(hours: 6);
 
   String get _currentUid => FirebaseAuth.instance.currentUser?.uid ?? '';
+
+  bool _isOldEscalatedTask(Map<String, dynamic> task) {
+    if (task['isEscalated'] != true) return false;
+    final baseline = DateTime.now().subtract(_staleEscalatedRetention);
+    final candidates = [
+      task['updatedAt'],
+      task['completedAt'],
+      task['deadline'],
+      task['createdAt'],
+    ];
+    DateTime? best;
+    for (final raw in candidates) {
+      final dt = DateTime.tryParse((raw ?? '').toString());
+      if (dt == null) continue;
+      if (best == null || dt.isAfter(best)) best = dt;
+    }
+    if (best == null) return false;
+    return best.isBefore(baseline);
+  }
+
+  bool _isStaleCompletedTask(Map<String, dynamic> task) {
+    if (_normalizeWorkStatus(task['status']) != 'completed') return false;
+    final baseline = DateTime.now().subtract(_completedRetention);
+    final candidates = [
+      task['completedAt'],
+      task['updatedAt'],
+      task['deadline'],
+      task['assignedAt'],
+      task['createdAt'],
+    ];
+    DateTime? best;
+    for (final raw in candidates) {
+      final dt = DateTime.tryParse((raw ?? '').toString());
+      if (dt == null) continue;
+      if (best == null || dt.isAfter(best)) best = dt;
+    }
+    if (best == null) return false;
+    return best.isBefore(baseline);
+  }
 
   TasksNotifier() : super([]) {
     _load();
@@ -329,7 +402,14 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
       state = const [];
       return;
     }
+    final staleIds = <String>{};
     state = all.where((t) {
+      if (_isOldEscalatedTask(t) || _isStaleCompletedTask(t)) {
+        final staleId = (t['id'] ?? '').toString();
+        if (staleId.isNotEmpty) staleIds.add(staleId);
+        return false;
+      }
+
       final participants = List<String>.from(t['participantIds'] ?? const []);
       final assigned = List<String>.from(t['assignedJuniorIds'] ?? const []);
       final assignedMany = List<String>.from(t['assignedToIds'] ?? const []);
@@ -348,6 +428,12 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
       return isOwner || isPublic || isAssigned;
     }).toList();
+
+    if (staleIds.isNotEmpty) {
+      for (final id in staleIds) {
+        HiveService.delete(HiveService.tasksBox, id);
+      }
+    }
   }
 
   void _listenToFirestore() {
@@ -388,20 +474,39 @@ class TasksNotifier extends StateNotifier<List<Map<String, dynamic>>> {
 
       // Remove stale task rows (for example after creator deletes a task)
       // while preserving pending local creates that are not yet on server.
+      final now = DateTime.now();
       final queue = HiveService.getSyncQueue();
-      final pendingCreateIds = queue
+      final pendingCreates = queue
           .where((q) =>
               (q['collection'] ?? '') == 'tasks' &&
               (q['action'] ?? '') == 'CREATE')
-          .map((q) => (q['documentId'] ?? '').toString())
-          .where((id) => id.isNotEmpty)
-          .toSet();
+          .toList();
+      final pendingCreatesByDocId = <String, List<Map<String, dynamic>>>{};
+      for (final item in pendingCreates) {
+        final docId = (item['documentId'] ?? '').toString();
+        if (docId.isEmpty) continue;
+        pendingCreatesByDocId.putIfAbsent(docId, () => []).add(item);
+      }
       final visibleIds = state
           .map((t) => (t['id'] ?? '').toString())
           .where((id) => id.isNotEmpty)
           .toSet();
       for (final staleId in visibleIds.difference(incomingIds)) {
-        if (pendingCreateIds.contains(staleId)) continue;
+        final pendingItems = pendingCreatesByDocId[staleId] ?? const [];
+        final hasFreshPendingCreate = pendingItems.any((item) {
+          final ts = DateTime.tryParse((item['timestamp'] ?? '').toString());
+          if (ts == null) return false;
+          return now.difference(ts) <= _pendingCreateRetention;
+        });
+        if (hasFreshPendingCreate) continue;
+
+        // Drop stale queued creates so ghost tasks don't reappear forever.
+        for (final item in pendingItems) {
+          final queueId = (item['id'] ?? '').toString();
+          if (queueId.isNotEmpty) {
+            writes.add(HiveService.removeFromSyncQueue(queueId));
+          }
+        }
         writes.add(HiveService.delete(HiveService.tasksBox, staleId));
       }
 
@@ -1145,6 +1250,16 @@ class NoticesNotifier extends StateNotifier<List<Notice>> {
 
       // Once cloud no longer returns an item, consider local delete fully settled.
       _pendingDeleteNoticeIds.removeWhere((id) => !incomingIds.contains(id));
+
+      // Reconcile local cache with cloud snapshot so stale notices are purged.
+      final local = HiveService.getAll(HiveService.noticesBox);
+      for (final m in local) {
+        final id = m['id'] as String? ?? '';
+        if (id.isEmpty) continue;
+        if (!incomingIds.contains(id) && !_pendingDeleteNoticeIds.contains(id)) {
+          writes.add(HiveService.delete(HiveService.noticesBox, id));
+        }
+      }
 
       if (writes.isNotEmpty) {
         await Future.wait(writes);
