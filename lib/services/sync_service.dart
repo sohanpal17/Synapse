@@ -12,6 +12,19 @@ const _uuid = Uuid();
 /// Manages offline sync queue and auto-escalation
 class SyncService {
   final FirestoreService _firestore = FirestoreService();
+  static const Duration _staleTaskCreateRetention = Duration(hours: 24);
+  static const Duration _maxEscalationDelay = Duration(hours: 24);
+
+  String _normalizeWorkStatus(dynamic raw) {
+    final status = (raw ?? '').toString().trim().toLowerCase();
+    if (status == 'completed' ||
+        status == 'complete' ||
+        status == 'done' ||
+        status == 'closed') {
+      return 'completed';
+    }
+    return 'inProgress';
+  }
 
   dynamic _sanitizeForHive(dynamic value) {
     if (value is Timestamp) {
@@ -101,6 +114,18 @@ class SyncService {
   Future<void> processQueue() async {
     final queue = HiveService.getSyncQueue();
     if (queue.isEmpty) return;
+
+    final now = DateTime.now();
+    for (final item in queue) {
+      final isStaleTaskCreate =
+          (item['collection'] ?? '') == 'tasks' &&
+          (item['action'] ?? '') == 'CREATE';
+      if (!isStaleTaskCreate) continue;
+      final queuedAt = DateTime.tryParse((item['timestamp'] ?? '').toString());
+      if (queuedAt != null && now.difference(queuedAt) > _staleTaskCreateRetention) {
+        await HiveService.removeFromSyncQueue((item['id'] ?? '').toString());
+      }
+    }
 
     // Sort by timestamp (oldest first)
     queue.sort((a, b) => (a['timestamp'] ?? '').toString().compareTo(
@@ -258,12 +283,29 @@ class SyncService {
     for (final task in tasks) {
       // Only escalate 'task' type, not 'assignment'
       if (task['type'] != 'task') continue;
-      if (task['status'] == 'completed') continue;
+      if (_normalizeWorkStatus(task['status']) == 'completed') continue;
       if (task['isEscalated'] == true) continue;
       if (task['autoEscalate'] != true) continue;
 
-      final deadline = DateTime.tryParse(task['deadline'] ?? '');
+      final deadline = DateTime.tryParse((task['deadline'] ?? '').toString());
       if (deadline != null && now.isAfter(deadline)) {
+        // Ignore very old overdue tasks to prevent stale escalation notification spam.
+        if (now.difference(deadline) > _maxEscalationDelay) {
+          task['autoEscalate'] = false;
+          task['updatedAt'] = now.toIso8601String();
+          await HiveService.put(HiveService.tasksBox, task['id'], task);
+          await queueAction(
+            action: 'UPDATE',
+            collection: 'tasks',
+            documentId: task['id'],
+            data: {
+              'autoEscalate': false,
+              'updatedAt': task['updatedAt'],
+            },
+          );
+          continue;
+        }
+
         // ESCALATE
         task['isEscalated'] = true;
         task['isPublic'] = true;
@@ -281,12 +323,6 @@ class SyncService {
           collection: 'tasks',
           documentId: task['id'],
           data: task,
-        );
-
-        // Local notification
-        await NotificationService.show(
-          title: '⚠️ Task Escalated',
-          body: '"${task['title']}" deadline missed — now visible to entire team.',
         );
 
         debugPrint('Escalated task: ${task['title']}');
